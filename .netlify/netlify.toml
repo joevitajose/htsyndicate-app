@@ -1,15 +1,20 @@
-functionsDirectory = "/Users/joevitajose/Desktop/htsyndicate-app/netlify/functions"
-functionsDirectoryOrigin = "config"
 plugins = []
+functionsDirectory = "/Users/joevitajose/Desktop/htsyndicate-app/functions"
+functionsDirectoryOrigin = "config"
 headers = []
 redirects = []
+
+[functions]
+
+[functions."*"]
+node_bundler = "esbuild"
 
 [build]
 publish = "/Users/joevitajose/Desktop/htsyndicate-app/dist"
 publishOrigin = "config"
 commandOrigin = "config"
 command = "npm run build"
-functions = "/Users/joevitajose/Desktop/htsyndicate-app/netlify/functions"
+functions = "/Users/joevitajose/Desktop/htsyndicate-app/functions"
 
 [build.environment]
 
@@ -24,8 +29,3 @@ functions = "/Users/joevitajose/Desktop/htsyndicate-app/netlify/functions"
 [build.processing.js]
 
 [build.services]
-
-[functions]
-
-[functions."*"]
-node_bundler = "esbuild"
