@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { useRealtimeLeads } from './components/RealtimeLeads';
 import { supabase, leadFromDb, leadToDb, leaveFromDb, leaveToDb, bankPaymentFromDb, bankPaymentToDb, notifFromDb, notifToDb, profileFromDb, punchStateFromDb } from "./supabase.js";
 import { syncLeadToSheet, syncAllLeadsToSheet, checkForNewLeads, rowToLead, isConfigured as isSheetsConfigured, MASTER_SHEET_ID, MASTER_SHEET_NAME } from "./sheets.js";
 const FONT="Satoshi,sans-serif",MONO="JetBrains Mono,monospace";
@@ -158,7 +159,7 @@ const DEFAULT_CLOSER_STAGES=[
 /* Default pipelines — each pipeline filters leads by source(s) */
 const DEFAULT_PIPELINES=[
 {id:"all",name:"All Leads",sources:[],color:T.tx,icon:"users"},
-{id:"webinar",name:"Webinar",sources:["webinar"],color:T.cyn,icon:"play"},
+{id:"webinar",name:"Webinar",sources:["webinar","FACEBOOK","bio","sp_auto_dm","direct"],color:T.cyn,icon:"play"},
 {id:"instagram-outbound",name:"Instagram Outbound",sources:["instagram-outbound"],color:"#e1306c",icon:"link"},
 {id:"instagram-inbound",name:"Instagram Inbound",sources:["instagram-inbound"],color:"#833AB4",icon:"link"},
 {id:"whop-leads",name:"Whop Leads",sources:["whop-course-buyer"],color:T.pur,icon:"whop"},
@@ -2454,13 +2455,13 @@ useEffect(()=>{
       const p=authUserToProfile(session.user);
       setUser(p);setPg(pg=>pg||getNav(p.role)[0]?.id);
       /* Sync profile to DB in background; create if missing */
-      supabase.from('profiles').select('*').eq('id',session.user.id).single().then(({data})=>{
+      supabase.from('profiles').select('*').eq('id',session.user.id).maybeSingle().then(({data})=>{
         if(data){setUser(profileFromDb(data));}
         else{
           supabase.from('profiles').upsert(
             {id:session.user.id,name:p.name,email:p.email,role:p.role,subrole:p.subrole,dept:p.dept,provider:p.provider},
             {onConflict:'id'}
-          ).then(({data:d2})=>{if(d2?.[0])setUser(profileFromDb(d2[0]));}).catch(()=>{});
+          ).then(({data:d2,error:e2})=>{if(e2)console.error("[PROFILE bg upsert]",JSON.stringify(e2,null,2));if(d2?.[0])setUser(profileFromDb(d2[0]));});
         }
       }).catch(()=>{});
     }else{
