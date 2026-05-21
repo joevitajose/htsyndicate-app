@@ -18,6 +18,7 @@ export const leadFromDb = (r) => ({
   email: r.email,
   phone: r.phone,
   source: r.source,
+  pipeline: r.pipeline,  // ← ADD THIS LINE
   setterStage: r.setter_stage,
   closerStage: r.closer_stage,
   priority: r.priority,
@@ -46,6 +47,7 @@ export const leadToDb = (l) => ({
   email: l.email,
   phone: l.phone,
   source: l.source,
+  pipeline: l.pipeline,  // ← ADD THIS LINE
   setter_stage: l.setterStage,
   closer_stage: l.closerStage,
   priority: l.priority,
