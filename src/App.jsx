@@ -1,22 +1,33 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useRealtimeLeads } from './components/RealtimeLeads';
 import { supabase, leadFromDb, leadToDb, leaveFromDb, leaveToDb, bankPaymentFromDb, bankPaymentToDb, notifFromDb, notifToDb, profileFromDb, punchStateFromDb } from "./supabase.js";
 import { syncLeadToSheet, syncAllLeadsToSheet, checkForNewLeads, rowToLead, isConfigured as isSheetsConfigured, MASTER_SHEET_ID, MASTER_SHEET_NAME } from "./sheets.js";
+import { initPushNotifications, isPushSupported } from "./push.js";
+import { notifyNewLead, notifyPayment, notifyCallLogged, notifyStageChange, notifyAssignment, notifyHotLead } from "./notifications.js";
 const FONT="Satoshi,sans-serif",MONO="JetBrains Mono,monospace";
-const T={bg:"#060709",s1:"#0c0d12",s2:"#111318",s3:"#16181f",bdr:"#1e2029",inp:"#0e0f15",tx:"#e6e7ec",tx2:"#9a9caa",tx3:"#5b5d6b",acc:"#d4943e",accD:"#b87a2a",accBg:"#d4943e10",grn:"#3dd68c",grnD:"#14532d",grnBg:"#3dd68c10",red:"#ef6b6b",redD:"#7f1d1d",redBg:"#ef6b6b10",yel:"#eab308",yelD:"#713f12",yelBg:"#eab30810",blu:"#5b9cf5",bluBg:"#5b9cf510",pur:"#a07cf5",purBg:"#a07cf510",cyn:"#22c3d6",cynBg:"#22c3d610"};
+const T={bg:"#0A0A0A",s1:"#111111",s2:"#1A1A1A",s3:"#111111",bdr:"#1f1f1f",inp:"#1A1A1A",tx:"#F5F5F7",tx2:"#86868B",tx3:"#48484A",acc:"#C9A84C",accD:"#A8893A",accL:"#E8C96A",accBg:"#C9A84C1f",grn:"#32D74B",grnD:"#14532d",grnBg:"#32D74B10",red:"#FF453A",redD:"#7f1d1d",redBg:"#FF453A10",yel:"#eab308",yelD:"#713f12",yelBg:"#eab30810",blu:"#0A84FF",bluBg:"#0A84FF10",pur:"#a07cf5",purBg:"#a07cf510",cyn:"#22c3d6",cynBg:"#22c3d610"};
 const TODAY="2026-05-02",uid=()=>Math.random().toString(36).slice(2,9);
 const fmt=n=>new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:0}).format(n);
 const fS=n=>n>=1e7?("₹"+(n/1e7).toFixed(1)+"Cr"):n>=1e5?("₹"+(n/1e5).toFixed(1)+"L"):n>=1e3?("₹"+(n/1e3).toFixed(0)+"K"):fmt(n);
 const pc=(a,b)=>b?((a/b)*100).toFixed(1):0;
+/* Persist a lead row to Supabase with VISIBLE error reporting.
+   Silent .update() failures (most often a missing column like `pipeline`)
+   were the reason edits appeared to "revert on refresh" — the local state
+   changed but the write was rejected by Postgres and never reached the DB. */
+const saveLead=(u)=>{
+  const row=leadToDb(u);
+  console.log('[saveLead] → writing',{id:u.id,pipeline:row.pipeline,setterStage:row.setter_stage,closerStage:row.closer_stage});
+  /* .select('id') lets us catch the SILENT failure mode: an UPDATE that returns
+     no error but touches 0 rows (RLS blocked, or the id doesn't exist) — which
+     is exactly how "changes revert on refresh" looks when the DB never persisted. */
+  return supabase.from('leads').update(row).eq('id',u.id).select('id').then(({data,error})=>{
+    if(error){console.error('[saveLead] ✗ FAILED',{id:u.id,code:error.code,message:error.message,details:error.details,hint:error.hint});alert('Could not save changes to the database: '+(error.message||error.code||'unknown error'));return;}
+    if(!data||data.length===0){console.warn('[saveLead] ⚠ 0 rows updated — not persisted (RLS blocked or id not found)',{id:u.id});alert('Save did not persist: no matching row, or blocked by a security policy.');return;}
+    console.log('[saveLead] ✓ persisted',{id:u.id,rows:data.length});
+  });
+};
 const dBtw=(a,b)=>Math.ceil((new Date(b)-new Date(a))/864e5);
-const USERS=[
-{id:"boss",name:"Sir (Admin)",email:"boss@htsyndicate.com",password:"admin123",role:"admin",dept:"all",subrole:"admin"},
-{id:"you",name:"You (Admin)",email:"admin@htsyndicate.com",password:"admin123",role:"admin",dept:"all",subrole:"admin"},
-{id:"setter1",name:"Zoe (Setter)",email:"zoe@htsyndicate.com",password:"sales123",role:"sales",dept:"sales",subrole:"setter"},
-{id:"closer1",name:"Arjun (Closer)",email:"arjun@htsyndicate.com",password:"sales123",role:"sales",dept:"sales",subrole:"closer"},
-{id:"fin1",name:"Priya (Finance)",email:"priya@htsyndicate.com",password:"fin123",role:"finance",dept:"finance",subrole:"finance"},
-{id:"tech1",name:"Dev (Tech)",email:"dev@htsyndicate.com",password:"tech123",role:"tech",dept:"tech",subrole:"tech"},
-];
+const USERS=[];
 
 /* ICONS - pure path strings, no JSX */
 const ICON_PATHS={
@@ -71,15 +82,16 @@ function Ic({t,s=18,c="currentColor"}){
 }
 
 /* PRIMITIVES */
-function Bd({text,color}){
-  const c={grn:{bg:T.grnBg,fg:T.grn},red:{bg:T.redBg,fg:T.red},yel:{bg:T.yelBg,fg:T.yel},blu:{bg:T.bluBg,fg:T.blu},pur:{bg:T.purBg,fg:T.pur},acc:{bg:T.accBg,fg:T.acc},cyn:{bg:T.cynBg,fg:T.cyn},def:{bg:T.s3,fg:T.tx2}}[color||"def"]||{bg:T.s3,fg:T.tx2};
-  return <span style={{display:"inline-flex",padding:"2px 9px",borderRadius:5,fontSize:10,fontWeight:600,background:c.bg,color:c.fg,letterSpacing:.3,whiteSpace:"nowrap",textTransform:"capitalize"}}>{text}</span>;
+function Bd({text,color,solid}){
+  const c=(solid?{grn:{bg:T.grn,fg:"#000"},red:{bg:T.red,fg:"#fff"},yel:{bg:T.yel,fg:"#000"},blu:{bg:T.blu,fg:"#fff"},pur:{bg:T.pur,fg:"#fff"},acc:{bg:T.acc,fg:"#000"},cyn:{bg:T.cyn,fg:"#000"},def:{bg:T.s2,fg:T.tx2}}
+    :{grn:{bg:T.grnBg,fg:T.grn},red:{bg:T.redBg,fg:T.red},yel:{bg:T.yelBg,fg:T.yel},blu:{bg:T.bluBg,fg:T.blu},pur:{bg:T.purBg,fg:T.pur},acc:{bg:T.accBg,fg:T.acc},cyn:{bg:T.cynBg,fg:T.cyn},def:{bg:T.s2,fg:T.tx2}})[color||"def"]||{bg:T.s2,fg:T.tx2};
+  return <span style={{display:"inline-flex",padding:"2px 6px",borderRadius:4,fontSize:10,fontWeight:600,background:c.bg,color:c.fg,letterSpacing:.4,whiteSpace:"nowrap",textTransform:"uppercase"}}>{text}</span>;
 }
 function Pill({l,active,onClick,n}){return <button onClick={onClick} style={{display:"inline-flex",alignItems:"center",gap:5,padding:"5px 12px",borderRadius:7,fontSize:11,fontWeight:active?600:500,background:active?T.accBg:T.s1,color:active?T.acc:T.tx3,border:"1px solid "+(active?T.accD+"40":T.bdr),cursor:"pointer",fontFamily:FONT}}>{l}{n!==undefined&&<span style={{fontFamily:MONO,fontSize:9,opacity:.7}}>{n}</span>}</button>}
 function Btn({children,onClick,v,icon,sm,full}){
-  const styles={pri:{bg:"linear-gradient(135deg,"+T.accD+","+T.acc+")",c:"#000",b:"none"},dan:{bg:T.redBg,c:T.red,b:"1px solid "+T.redD+"30"},ok:{bg:T.grnBg,c:T.grn,b:"1px solid "+T.grnD+"30"},def:{bg:T.s1,c:T.tx2,b:"1px solid "+T.bdr}};
+  const styles={pri:{bg:T.acc,c:"#000",b:"none"},dan:{bg:T.red,c:"#fff",b:"none"},ok:{bg:T.grnBg,c:T.grn,b:"1px solid "+T.grnD+"30"},def:{bg:T.s2,c:T.tx,b:"1px solid "+T.bdr}};
   const s=styles[v||"def"]||styles.def;
-  return <button onClick={onClick} style={{display:"inline-flex",alignItems:"center",justifyContent:"center",gap:5,padding:sm?"4px 9px":"8px 16px",borderRadius:7,fontSize:sm?10:12,fontWeight:600,background:s.bg,color:s.c,border:s.b,cursor:"pointer",fontFamily:FONT,width:full?"100%":"auto",whiteSpace:"nowrap"}}>{icon&&<Ic t={icon} s={sm?12:14}/>}{children}</button>;
+  return <button onClick={onClick} onMouseEnter={e=>{e.currentTarget.style.filter="brightness(1.1)"}} onMouseLeave={e=>{e.currentTarget.style.filter="none"}} style={{display:"inline-flex",alignItems:"center",justifyContent:"center",gap:6,padding:sm?"5px 10px":"8px 16px",borderRadius:8,fontSize:sm?11:13,fontWeight:600,background:s.bg,color:s.c,border:s.b,cursor:"pointer",fontFamily:FONT,width:full?"100%":"auto",whiteSpace:"nowrap",transition:"filter .15s ease"}}>{icon&&<Ic t={icon} s={sm?12:14}/>}{children}</button>;
 }
 function Inp({label,value,onChange,ph,type,mono,ta}){
   const sty={padding:"8px 12px",borderRadius:7,border:"1px solid "+T.bdr,background:T.inp,color:T.tx,fontSize:12,fontFamily:mono?MONO:FONT,outline:"none",width:"100%",boxSizing:"border-box"};
@@ -100,36 +112,38 @@ function Sel({label,value,onChange,opts}){return(
 function St({label,value,sub,trend,icon,color}){
   const cl=color||T.acc;
   return(
-    <div style={{background:T.s3,borderRadius:10,padding:"15px 18px",border:"1px solid "+T.bdr,flex:1,minWidth:0}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-        <span style={{fontSize:10,color:T.tx3,fontWeight:500,textTransform:"uppercase",letterSpacing:.6}}>{label}</span>
-        <div style={{width:26,height:26,borderRadius:7,background:cl+"12",display:"flex",alignItems:"center",justifyContent:"center"}}><Ic t={icon||"tgt"} s={13} c={cl}/></div>
+    <div style={{background:T.s1,borderRadius:16,padding:20,border:"1px solid "+T.bdr,flex:1,minWidth:0,transition:"border-color .15s ease,transform .15s ease"}}
+      onMouseEnter={e=>{e.currentTarget.style.borderColor="rgba(255,255,255,0.16)";e.currentTarget.style.transform="translateY(-1px)"}}
+      onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.transform="translateY(0)"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:11,color:T.tx3,fontWeight:500,textTransform:"uppercase",letterSpacing:.8}}>{label}</span>
+        <div style={{width:32,height:32,borderRadius:8,background:cl+"1f",display:"flex",alignItems:"center",justifyContent:"center"}}><Ic t={icon||"tgt"} s={15} c={cl}/></div>
       </div>
-      <div style={{fontSize:22,fontWeight:700,color:T.tx,fontFamily:MONO,letterSpacing:-.5}}>{value}</div>
-      {(sub||trend!==undefined)&&<div style={{display:"flex",alignItems:"center",gap:5,fontSize:10,marginTop:5}}>
-        {trend!==undefined&&<span style={{color:trend>=0?T.grn:T.red,display:"flex",alignItems:"center",gap:2,fontWeight:600}}><Ic t={trend>=0?"aUp":"aDown"} s={10}/>{Math.abs(trend)}%</span>}
-        {sub&&<span style={{color:T.tx3}}>{sub}</span>}
+      <div style={{fontSize:28,fontWeight:600,color:T.tx,letterSpacing:-.8}}>{value}</div>
+      {(sub||trend!==undefined)&&<div style={{display:"flex",alignItems:"center",gap:5,fontSize:12,marginTop:6}}>
+        {trend!==undefined&&<span style={{color:trend>=0?T.grn:T.red,display:"flex",alignItems:"center",gap:2,fontWeight:600}}><Ic t={trend>=0?"aUp":"aDown"} s={11}/>{Math.abs(trend)}%</span>}
+        {sub&&<span style={{color:T.tx2}}>{sub}</span>}
       </div>}
     </div>
   );
 }
 function Bar({v,max,color,h}){return <div style={{width:"100%",height:h||5,background:T.bdr+"50",borderRadius:99,overflow:"hidden"}}><div style={{width:Math.min((v/max)*100,100)+"%",height:"100%",background:color||T.acc,borderRadius:99,transition:"width .5s"}}/></div>}
 function Crd({children,title,action,style:sx}){return(
-  <div style={{background:T.s3,borderRadius:10,border:"1px solid "+T.bdr,overflow:"hidden",...sx}}>
-    {(title||action)&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"13px 18px",borderBottom:"1px solid "+T.bdr,flexWrap:"wrap",gap:6}}><h3 style={{margin:0,fontSize:13,fontWeight:600,color:T.tx}}>{title}</h3>{action}</div>}
-    <div style={{padding:"14px 18px"}}>{children}</div>
+  <div style={{background:T.s1,borderRadius:16,border:"1px solid "+T.bdr,overflow:"hidden",...sx}}>
+    {(title||action)&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"15px 20px",borderBottom:"1px solid "+T.bdr,flexWrap:"wrap",gap:6}}><h3 style={{margin:0,fontSize:15,fontWeight:600,letterSpacing:-.2,color:T.tx}}>{title}</h3>{action}</div>}
+    <div style={{padding:"18px 20px"}}>{children}</div>
   </div>
 )}
 function Mod({title,onClose,children,wide}){return(
-  <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.78)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1e3,backdropFilter:"blur(5px)"}} onClick={onClose}>
-    <div style={{background:T.s1,borderRadius:14,width:"92%",maxWidth:wide?760:540,maxHeight:"86vh",display:"flex",flexDirection:"column",border:"1px solid "+T.bdr}} onClick={e=>e.stopPropagation()}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"15px 22px",borderBottom:"1px solid "+T.bdr}}><h2 style={{margin:0,fontSize:16,fontWeight:700,color:T.tx}}>{title}</h2><button onClick={onClose} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer"}}><Ic t="x"/></button></div>
+  <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1e3,backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)"}} onClick={onClose}>
+    <div style={{background:"#1C1C1E",borderRadius:16,width:"92%",maxWidth:wide?760:540,maxHeight:"86vh",display:"flex",flexDirection:"column",border:"1px solid "+T.bdr,boxShadow:"0 24px 64px rgba(0,0,0,0.5)"}} onClick={e=>e.stopPropagation()}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 22px",borderBottom:"1px solid "+T.bdr}}><h2 style={{margin:0,fontSize:17,fontWeight:600,letterSpacing:-.3,color:T.tx}}>{title}</h2><button onClick={onClose} style={{width:28,height:28,borderRadius:99,background:T.s2,border:"none",color:T.tx2,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}><Ic t="x" s={15}/></button></div>
       <div style={{padding:22,overflowY:"auto",flex:1}}>{children}</div>
     </div>
   </div>
 )}
 function TabBar({tabs,a,onChange}){return <div style={{display:"flex",gap:2,background:T.s1,borderRadius:8,padding:2,border:"1px solid "+T.bdr,flexWrap:"wrap"}}>{tabs.map(t=><button key={t.id} onClick={()=>onChange(t.id)} style={{padding:"6px 14px",borderRadius:6,fontSize:11,fontWeight:a===t.id?600:500,background:a===t.id?T.s3:"transparent",color:a===t.id?T.tx:T.tx3,border:"none",cursor:"pointer",fontFamily:FONT}}>{t.l}</button>)}</div>}
-function Av({name,sz,color}){const s=sz||32;return <div style={{width:s,height:s,borderRadius:99,background:color||"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:s*.34,fontFamily:MONO,flexShrink:0}}>{name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}</div>}
+function Av({name,sz,color}){const s=sz||32;return <div style={{width:s,height:s,borderRadius:99,background:color||"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:700,fontSize:s*.34,fontFamily:MONO,flexShrink:0}}>{(name||"?").split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}</div>}
 
 /* DATA */
 /* Default SETTER pipeline stages */
@@ -168,26 +182,30 @@ const DEFAULT_PIPELINES=[
 const SETTER_STAGES=DEFAULT_SETTER_STAGES;
 const CLOSER_STAGES=DEFAULT_CLOSER_STAGES;
 const STAGES=SETTER_STAGES;
-const SOURCES=["Whop (Course Buyer)","LinkedIn","Website","Referral","Cold Call","Cold Email","Google Ads","Instagram","Partner","Inbound Call"];
-const stL=(s,kind)=>(kind==="closer"?CLOSER_STAGES:SETTER_STAGES).find(x=>x.id===s)?.l||s;
+const SOURCES=["webinar","FACEBOOK","bio","sp_auto_dm","direct","Whop (Course Buyer)","LinkedIn","Website","Referral","Cold Call","Cold Email","Google Ads","Instagram","Partner","Inbound Call"];const stL=(s,kind)=>(kind==="closer"?CLOSER_STAGES:SETTER_STAGES).find(x=>x.id===s)?.l||s;
 const stC=(s,kind)=>(kind==="closer"?CLOSER_STAGES:SETTER_STAGES).find(x=>x.id===s)?.c||T.tx3;
 
-/* Heat calculation: 
-   - New lead → warm for 1 hour, then cold
-   - Token paid → warm for 2 days, then cold
-   - Manual override possible via priority field */
-const NOW_TS=new Date("2026-05-02T11:30:00").getTime();
+/* Work hours: leads only count as "hot" between 10:00 and 19:00 local time.
+   Outside hours, new leads are "cold" until the next workday window. */
+const WORK_HOUR_START=10,WORK_HOUR_END=19;
+const isWorkHours=(d=new Date())=>{const h=d.getHours();return h>=WORK_HOUR_START&&h<WORK_HOUR_END;};
+
+/* Heat calculation:
+   - Token paid → hot for 48h regardless of time-of-day (real money in)
+   - New lead → hot ONLY if created within last 1 hour AND we are in work hours
+   - Otherwise warm/cold based on age */
 const calcHeat=(lead)=>{
+  const now=Date.now();
   if(lead.tokenPaidAt){
     const dt=new Date(lead.tokenPaidAt).getTime();
-    const hrs=(NOW_TS-dt)/(1000*60*60);
+    const hrs=(now-dt)/(1000*60*60);
     if(hrs<48) return "hot";
     return "cold";
   }
   if(lead.createdAt){
     const dt=new Date(lead.createdAt).getTime();
-    const mins=(NOW_TS-dt)/(1000*60);
-    if(mins<60) return "hot";
+    const mins=(now-dt)/(1000*60);
+    if(mins<60&&isWorkHours()) return "hot";
     if(mins<60*24) return "warm";
     return "cold";
   }
@@ -197,115 +215,9 @@ const heatColor=h=>h==="hot"?"red":h==="warm"?"yel":"blu";
 const fmtDT=ts=>{if(!ts)return"—";const d=new Date(ts);return d.toLocaleDateString("en-IN",{day:"2-digit",month:"short"})+" "+d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true})};
 const waUrl=(phone,name)=>{if(!phone)return null;const d=phone.replace(/\D/g,"");if(!d)return null;return"https://wa.me/"+d+"?text=Hi%20"+encodeURIComponent((name||"").split(" ")[0]||"there")};
 
-const mkLeads=()=>[
-{id:uid(),name:"Raj Malhotra",company:"GrowthX Agency",email:"raj@growthx.in",phone:"+91 98765 43210",source:"Whop (Course Buyer)",setterStage:"qualified",closerStage:"qualified",priority:"hot",value:2500000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"VIP Course",city:"Mumbai",industry:"Agency",notes:"Whop buyer. VIP upsell.",createdAt:"2026-04-20T10:30:00",tokenPaidAt:"2026-05-01T14:00:00",firstPaidAt:"2026-05-01T14:00:00",calls:3,callLogs:[{date:"2026-04-28T11:00:00",dur:12,out:"Interested",by:"Zoe"},{date:"2026-04-30T15:00:00",dur:18,out:"Discussed VIP",by:"Arjun"},{date:"2026-05-01T10:00:00",dur:8,out:"Needs case studies",by:"Arjun"}],followUps:[{date:"2026-04-28",done:true,note:"Qualifying call"},{date:"2026-05-03",done:false,note:"Decision call"}],setterHistory:[{stage:"new",at:"2026-04-20T10:30:00",by:"System"},{stage:"call_booked",at:"2026-04-22T14:00:00",by:"Zoe"},{stage:"showup",at:"2026-04-23T15:00:00",by:"Zoe"},{stage:"qualified",at:"2026-04-25T11:00:00",by:"Zoe"}],closerHistory:[{stage:"new",at:"2026-04-22T14:00:00",by:"System (handed off)"},{stage:"showup",at:"2026-04-23T15:00:00",by:"Arjun"},{stage:"qualified",at:"2026-04-30T15:00:00",by:"Arjun"}],payments:[{amount:50000,date:"2026-05-01T14:00:00",what:"Token Payment - VIP Course",type:"token"}]},
-{id:uid(),name:"Sara Ahmed",company:"DigitalEdge Co",email:"sara@de.com",phone:"+91 87654 32109",source:"LinkedIn",setterStage:"qualified",closerStage:"showup",priority:"hot",value:1800000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"Enterprise",city:"Bangalore",industry:"Marketing",notes:"Wants 10% off.",createdAt:"2026-04-15T09:00:00",tokenPaidAt:null,firstPaidAt:null,calls:6,callLogs:[{date:"2026-04-22T14:00:00",dur:25,out:"Feature deep dive",by:"Arjun"},{date:"2026-05-01T11:00:00",dur:10,out:"Revised proposal",by:"Arjun"}],followUps:[{date:"2026-05-05",done:false,note:"Closing call"}],setterHistory:[{stage:"new",at:"2026-04-15T09:00:00",by:"System"},{stage:"call_booked",at:"2026-04-18T11:00:00",by:"Zoe"},{stage:"showup",at:"2026-04-20T14:00:00",by:"Zoe"},{stage:"qualified",at:"2026-04-22T16:00:00",by:"Zoe"}],closerHistory:[{stage:"new",at:"2026-04-18T11:00:00",by:"System"},{stage:"showup",at:"2026-04-20T14:00:00",by:"Arjun"}],payments:[]},
-{id:uid(),name:"Tom Wilson",company:"ScaleForce Inc",email:"tom@sf.com",phone:"+1 415 555 0123",source:"Referral",setterStage:"won",closerStage:"won",priority:"hot",value:5200000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"Enterprise",city:"SF",industry:"SaaS",notes:"2-year deal.",createdAt:"2026-03-10T11:00:00",tokenPaidAt:"2026-04-05T10:00:00",firstPaidAt:"2026-04-18T15:00:00",calls:12,callLogs:[{date:"2026-03-15T11:00:00",dur:30,out:"Pitch",by:"Arjun"},{date:"2026-04-18T15:00:00",dur:10,out:"Signed!",by:"Arjun"}],followUps:[],setterHistory:[{stage:"new",at:"2026-03-10T11:00:00",by:"System"},{stage:"call_booked",at:"2026-03-12T14:00:00",by:"Zoe"},{stage:"showup",at:"2026-03-15T11:00:00",by:"Zoe"},{stage:"qualified",at:"2026-03-15T11:30:00",by:"Zoe"},{stage:"won",at:"2026-04-18T15:00:00",by:"System"}],closerHistory:[{stage:"new",at:"2026-03-12T14:00:00",by:"System"},{stage:"showup",at:"2026-03-15T11:00:00",by:"Arjun"},{stage:"qualified",at:"2026-03-22T10:00:00",by:"Arjun"},{stage:"won",at:"2026-04-18T15:00:00",by:"Arjun"}],payments:[{amount:1000000,date:"2026-04-05T10:00:00",what:"Token Payment - Enterprise Y1",type:"token"},{amount:4200000,date:"2026-04-18T15:00:00",what:"Final Payment - Enterprise Y1",type:"final"}]},
-{id:uid(),name:"Meera Joshi",company:"BrandCraft",email:"meera@bc.in",phone:"+91 76543 21098",source:"Whop (Course Buyer)",setterStage:"call_booked",closerStage:"new",priority:"warm",value:950000,setter:"Zoe (Setter)",closer:"",product:"VIP Course",city:"Pune",industry:"Agency",notes:"VIP interest.",createdAt:"2026-04-28T16:00:00",tokenPaidAt:null,firstPaidAt:null,calls:1,callLogs:[{date:"2026-05-01T11:00:00",dur:8,out:"Budget concern",by:"Zoe"}],followUps:[{date:"2026-05-02",done:false,note:"Send pricing"}],setterHistory:[{stage:"new",at:"2026-04-28T16:00:00",by:"System (Whop webhook)"},{stage:"call_booked",at:"2026-05-01T11:00:00",by:"Zoe"}],closerHistory:[{stage:"new",at:"2026-05-01T11:00:00",by:"System (handed off)"}],payments:[]},
-{id:uid(),name:"Alex Chen",company:"NexaVentures",email:"alex@nv.com",phone:"+1 650 555 0789",source:"Google Ads",setterStage:"new",closerStage:null,priority:"cold",value:750000,setter:"Zoe (Setter)",closer:"",product:"Starter",city:"Austin",industry:"Tech",notes:"Ad lead.",createdAt:"2026-05-02T10:45:00",tokenPaidAt:null,firstPaidAt:null,calls:0,callLogs:[],followUps:[{date:"2026-05-02",done:false,note:"Initial call"}],setterHistory:[{stage:"new",at:"2026-05-02T10:45:00",by:"System (Google Ads webhook)"}],closerHistory:[],payments:[]},
-{id:uid(),name:"Priya Nair",company:"EcomBoost",email:"priya@eb.in",phone:"+91 65432 10987",source:"Instagram",setterStage:"qualified",closerStage:"showup",priority:"warm",value:1200000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"Growth",city:"Chennai",industry:"Ecom",notes:"Demo May 4.",createdAt:"2026-04-22T13:00:00",tokenPaidAt:null,firstPaidAt:null,calls:2,callLogs:[{date:"2026-04-25T15:00:00",dur:15,out:"Qualified",by:"Zoe"},{date:"2026-04-30T11:00:00",dur:5,out:"Demo confirmed",by:"Arjun"}],followUps:[{date:"2026-05-04",done:false,note:"Demo"}],setterHistory:[{stage:"new",at:"2026-04-22T13:00:00",by:"System"},{stage:"call_booked",at:"2026-04-23T16:00:00",by:"Zoe"},{stage:"showup",at:"2026-04-25T15:00:00",by:"Zoe"},{stage:"qualified",at:"2026-04-25T15:30:00",by:"Zoe"}],closerHistory:[{stage:"new",at:"2026-04-23T16:00:00",by:"System"},{stage:"showup",at:"2026-04-25T15:00:00",by:"Arjun"}],payments:[]},
-{id:uid(),name:"James Brown",company:"Pinnacle Digital",email:"james@pd.io",phone:"+1 212 555 0321",source:"Partner",setterStage:"won",closerStage:"won",priority:"hot",value:6800000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"Enterprise",city:"NYC",industry:"Software",notes:"Biggest Q1 deal.",createdAt:"2026-02-15T10:00:00",tokenPaidAt:"2026-03-20T11:00:00",firstPaidAt:"2026-04-20T14:00:00",calls:18,callLogs:[],followUps:[],setterHistory:[{stage:"new",at:"2026-02-15T10:00:00",by:"System"},{stage:"call_booked",at:"2026-02-18T11:00:00",by:"Zoe"},{stage:"qualified",at:"2026-02-25T15:00:00",by:"Zoe"},{stage:"won",at:"2026-04-20T14:00:00",by:"System"}],closerHistory:[{stage:"new",at:"2026-02-18T11:00:00",by:"System"},{stage:"showup",at:"2026-02-22T14:00:00",by:"Arjun"},{stage:"qualified",at:"2026-03-01T10:00:00",by:"Arjun"},{stage:"won",at:"2026-04-20T14:00:00",by:"Arjun"}],payments:[{amount:3400000,date:"2026-03-20T11:00:00",what:"50% Advance - Enterprise Multi-year",type:"token"},{amount:3400000,date:"2026-04-20T14:00:00",what:"Final Payment",type:"final"}]},
-{id:uid(),name:"Ananya Desai",company:"LaunchPad",email:"ananya@lp.in",phone:"+91 54321 09876",source:"Whop (Course Buyer)",setterStage:"qualified",closerStage:"qualified",priority:"hot",value:3200000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"VIP+Consulting",city:"Hyderabad",industry:"EdTech",notes:"Proposal sent.",createdAt:"2026-04-10T09:00:00",tokenPaidAt:null,firstPaidAt:null,calls:5,callLogs:[{date:"2026-04-15T11:00:00",dur:22,out:"Bundle talk",by:"Arjun"},{date:"2026-05-01T15:00:00",dur:12,out:"Proposal sent",by:"Arjun"}],followUps:[{date:"2026-05-06",done:false,note:"Decision"}],setterHistory:[{stage:"new",at:"2026-04-10T09:00:00",by:"System (Whop)"},{stage:"call_booked",at:"2026-04-12T14:00:00",by:"Zoe"},{stage:"showup",at:"2026-04-15T11:00:00",by:"Zoe"},{stage:"qualified",at:"2026-04-15T12:00:00",by:"Zoe"}],closerHistory:[{stage:"new",at:"2026-04-12T14:00:00",by:"System"},{stage:"showup",at:"2026-04-15T11:00:00",by:"Arjun"},{stage:"qualified",at:"2026-04-25T15:00:00",by:"Arjun"}],payments:[]},
-{id:uid(),name:"Vikram Shah",company:"CloudNine",email:"vik@c9.in",phone:"+91 43210 98765",source:"Cold Call",setterStage:"lost",closerStage:"lost",priority:"cold",value:1100000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"Growth",city:"Ahmedabad",industry:"IT",notes:"Lost to competitor.",createdAt:"2026-03-20T10:00:00",tokenPaidAt:null,firstPaidAt:null,calls:4,callLogs:[],followUps:[],setterHistory:[{stage:"new",at:"2026-03-20T10:00:00",by:"System"},{stage:"call_booked",at:"2026-03-22T11:00:00",by:"Zoe"},{stage:"qualified",at:"2026-03-25T14:00:00",by:"Zoe"},{stage:"lost",at:"2026-04-15T10:00:00",by:"System"}],closerHistory:[{stage:"new",at:"2026-03-22T11:00:00",by:"System"},{stage:"showup",at:"2026-03-25T14:00:00",by:"Arjun"},{stage:"lost",at:"2026-04-15T10:00:00",by:"Arjun"}],payments:[]},
-{id:uid(),name:"Lisa Park",company:"FutureScale",email:"lisa@fs.co",phone:"+1 310 555 0654",source:"Website",setterStage:"qualified",closerStage:"showup",priority:"warm",value:2200000,setter:"Zoe (Setter)",closer:"Arjun (Closer)",product:"Enterprise",city:"LA",industry:"AI",notes:"VP Eng interested.",createdAt:"2026-04-18T13:00:00",tokenPaidAt:null,firstPaidAt:null,calls:3,callLogs:[{date:"2026-04-22T15:00:00",dur:20,out:"Discovery",by:"Arjun"},{date:"2026-04-29T11:00:00",dur:15,out:"Tech docs sent",by:"Arjun"}],followUps:[{date:"2026-05-03",done:false,note:"CTO call"}],setterHistory:[{stage:"new",at:"2026-04-18T13:00:00",by:"System"},{stage:"call_booked",at:"2026-04-20T11:00:00",by:"Zoe"},{stage:"showup",at:"2026-04-22T15:00:00",by:"Zoe"},{stage:"qualified",at:"2026-04-22T16:00:00",by:"Zoe"}],closerHistory:[{stage:"new",at:"2026-04-20T11:00:00",by:"System"},{stage:"showup",at:"2026-04-22T15:00:00",by:"Arjun"}],payments:[]},
-];
-const mkInv=()=>[
-{id:"HTS-001",client:"ScaleForce Inc",amount:5200000,paid:5200000,status:"paid",date:"2026-04-01",due:"2026-04-30",items:[{d:"Enterprise Annual",q:1,r:5200000}],tax:18,recurring:false,notes:"Paid"},
-{id:"HTS-002",client:"Pinnacle Digital",amount:6800000,paid:3400000,status:"partial",date:"2026-04-05",due:"2026-05-05",items:[{d:"Enterprise Multi-year",q:1,r:5800000},{d:"Support",q:1,r:1000000}],tax:18,recurring:false,notes:"50% advance"},
-{id:"HTS-003",client:"GrowthX Agency",amount:150000,paid:150000,status:"paid",date:"2026-04-01",due:"2026-04-15",items:[{d:"Retainer Apr",q:1,r:150000}],tax:18,recurring:true,notes:"Monthly"},
-{id:"HTS-004",client:"GrowthX Agency",amount:150000,paid:0,status:"overdue",date:"2026-05-01",due:"2026-05-01",items:[{d:"Retainer May",q:1,r:150000}],tax:18,recurring:true,notes:"Overdue"},
-{id:"HTS-005",client:"DigitalEdge Co",amount:100000,paid:100000,status:"paid",date:"2026-04-01",due:"2026-04-10",items:[{d:"Consulting Apr",q:1,r:100000}],tax:18,recurring:true,notes:""},
-{id:"HTS-006",client:"DigitalEdge Co",amount:100000,paid:0,status:"sent",date:"2026-05-01",due:"2026-05-10",items:[{d:"Consulting May",q:1,r:100000}],tax:18,recurring:true,notes:"Auto-generated"},
-];
-const mkTasks=()=>[
-{id:uid(),title:"Call Raj - VIP decision",dept:"sales",assignee:"Arjun (Closer)",status:"todo",priority:"high",due:"2026-05-03"},
-{id:uid(),title:"Send case studies to Raj",dept:"sales",assignee:"Zoe (Setter)",status:"in_progress",priority:"high",due:"2026-05-02"},
-{id:uid(),title:"Prepare EcomBoost demo",dept:"sales",assignee:"Arjun (Closer)",status:"todo",priority:"medium",due:"2026-05-04"},
-{id:uid(),title:"Chase GrowthX overdue",dept:"finance",assignee:"Priya (Finance)",status:"todo",priority:"critical",due:"2026-05-02"},
-{id:uid(),title:"Monthly GST Filing",dept:"finance",assignee:"Priya (Finance)",status:"in_progress",priority:"high",due:"2026-05-10"},
-{id:uid(),title:"Fix Whop webhook",dept:"tech",assignee:"Dev (Tech)",status:"todo",priority:"high",due:"2026-05-03"},
-{id:uid(),title:"Qualify new Whop buyers",dept:"sales",assignee:"Zoe (Setter)",status:"todo",priority:"high",due:"2026-05-02"},
-{id:uid(),title:"Deploy invoice auto v2",dept:"tech",assignee:"Dev (Tech)",status:"in_progress",priority:"medium",due:"2026-05-07"},
-];
-const mkAutos=()=>[
-{id:uid(),name:"Full Payment → Invoice",trigger:"Payment = 100%",action:"Generate & email invoice",dept:"finance",status:"active",runs:47,rate:100,type:"invoice"},
-{id:uid(),name:"Partial Payment → Receipt",trigger:"Payment < total",action:"Generate partial receipt",dept:"finance",status:"active",runs:12,rate:100,type:"invoice"},
-{id:uid(),name:"Overdue → Reminder",trigger:"Due passed + unpaid",action:"Email Day 1,7,14,30",dept:"finance",status:"active",runs:23,rate:95.7,type:"invoice"},
-{id:uid(),name:"Whop Buy → Lead",trigger:"New Whop purchase",action:"Create lead, assign Zoe",dept:"sales",status:"active",runs:84,rate:100,type:"lead"},
-{id:uid(),name:"Follow-up Reminder",trigger:"Follow-up = today",action:"Notify person",dept:"sales",status:"active",runs:156,rate:98.1,type:"lead"},
-{id:uid(),name:"Deal Won → Draft Invoice",trigger:"Stage → Won",action:"Create draft invoice",dept:"finance",status:"active",runs:18,rate:100,type:"invoice"},
-{id:uid(),name:"Recurring Invoices",trigger:"1st of month",action:"Generate retainer invoices",dept:"finance",status:"active",runs:32,rate:100,type:"invoice"},
-{id:uid(),name:"Daily Sales Digest",trigger:"9 AM daily",action:"Email leads/calls summary",dept:"sales",status:"active",runs:112,rate:100,type:"report"},
-{id:uid(),name:"Punch → Google Sheet",trigger:"Punch in/out",action:"Log to Sheet",dept:"all",status:"active",runs:340,rate:99.7,type:"attendance"},
-{id:uid(),name:"Task Overdue Escalation",trigger:"Task past due",action:"Notify then escalate 48h",dept:"all",status:"active",runs:9,rate:100,type:"task"},
-{id:uid(),name:"Stale Lead Alert",trigger:"No contact 5+ days",action:"Slack alert",dept:"sales",status:"active",runs:31,rate:100,type:"lead"},
-{id:uid(),name:"Weekly Productivity",trigger:"Friday 6 PM",action:"Compile report",dept:"all",status:"active",runs:8,rate:100,type:"report"},
-];
-const mkPunch=()=>({"Zoe (Setter)":{in:true,inT:"09:58 AM",outT:null,tasks:4,calls:6,hrs:4.2,prod:82,dept:"sales",hist:[
-{d:"2026-05-01",i:"10:02 AM",o:"06:45 PM",h:8.7,t:7,c:9,p:88,status:"present",late:true},
-{d:"2026-04-30",i:"09:55 AM",o:"06:30 PM",h:8.6,t:6,c:11,p:91,status:"present",late:false},
-{d:"2026-04-29",i:"10:15 AM",o:"06:15 PM",h:8.0,t:5,c:8,p:78,status:"present",late:true},
-{d:"2026-04-28",i:"09:50 AM",o:"06:40 PM",h:8.8,t:8,c:10,p:92,status:"present",late:false},
-{d:"2026-04-27",i:"",o:"",h:0,t:0,c:0,p:0,status:"weekend",late:false},
-{d:"2026-04-26",i:"",o:"",h:0,t:0,c:0,p:0,status:"weekend",late:false},
-{d:"2026-04-25",i:"09:45 AM",o:"06:50 PM",h:9.1,t:9,c:12,p:95,status:"present",late:false},
-{d:"2026-04-24",i:"",o:"",h:0,t:0,c:0,p:0,status:"leave",late:false},
-{d:"2026-04-23",i:"10:30 AM",o:"06:00 PM",h:7.5,t:4,c:6,p:68,status:"present",late:true},
-{d:"2026-04-22",i:"09:40 AM",o:"06:30 PM",h:8.8,t:7,c:9,p:89,status:"present",late:false},
-{d:"2026-04-21",i:"09:55 AM",o:"06:45 PM",h:8.8,t:6,c:8,p:85,status:"present",late:false},
-]},"Arjun (Closer)":{in:true,inT:"10:05 AM",outT:null,tasks:3,calls:4,hrs:3.9,prod:76,dept:"sales",hist:[
-{d:"2026-05-01",i:"10:10 AM",o:"07:00 PM",h:8.8,t:5,c:7,p:85,status:"present",late:true},
-{d:"2026-04-30",i:"09:50 AM",o:"06:40 PM",h:8.8,t:6,c:8,p:90,status:"present",late:false},
-{d:"2026-04-29",i:"10:20 AM",o:"06:30 PM",h:8.2,t:4,c:6,p:72,status:"present",late:true},
-{d:"2026-04-28",i:"09:30 AM",o:"07:15 PM",h:9.8,t:7,c:11,p:94,status:"present",late:false},
-{d:"2026-04-25",i:"10:45 AM",o:"05:30 PM",h:6.8,t:3,c:4,p:58,status:"halfday",late:true},
-{d:"2026-04-24",i:"09:55 AM",o:"06:30 PM",h:8.6,t:5,c:7,p:82,status:"present",late:false},
-{d:"2026-04-23",i:"",o:"",h:0,t:0,c:0,p:0,status:"absent",late:false},
-{d:"2026-04-22",i:"10:00 AM",o:"06:45 PM",h:8.8,t:6,c:9,p:88,status:"present",late:false},
-{d:"2026-04-21",i:"09:40 AM",o:"06:30 PM",h:8.8,t:5,c:8,p:84,status:"present",late:false},
-]},"Priya (Finance)":{in:true,inT:"09:30 AM",outT:null,tasks:5,calls:2,hrs:4.7,prod:90,dept:"finance",hist:[
-{d:"2026-05-01",i:"09:35 AM",o:"06:15 PM",h:8.7,t:8,c:3,p:94,status:"present",late:false},
-{d:"2026-04-30",i:"09:30 AM",o:"06:00 PM",h:8.5,t:7,c:2,p:92,status:"present",late:false},
-{d:"2026-04-29",i:"09:25 AM",o:"06:30 PM",h:9.1,t:9,c:4,p:96,status:"present",late:false},
-{d:"2026-04-28",i:"09:40 AM",o:"06:15 PM",h:8.6,t:6,c:2,p:88,status:"present",late:false},
-{d:"2026-04-25",i:"09:30 AM",o:"06:00 PM",h:8.5,t:7,c:3,p:91,status:"present",late:false},
-{d:"2026-04-24",i:"09:35 AM",o:"06:10 PM",h:8.6,t:8,c:2,p:93,status:"present",late:false},
-{d:"2026-04-23",i:"09:20 AM",o:"06:20 PM",h:9.0,t:7,c:3,p:90,status:"present",late:false},
-{d:"2026-04-22",i:"09:30 AM",o:"06:00 PM",h:8.5,t:6,c:2,p:87,status:"present",late:false},
-]},"Dev (Tech)":{in:false,inT:null,outT:null,tasks:0,calls:0,hrs:0,prod:0,dept:"tech",hist:[
-{d:"2026-05-01",i:"10:00 AM",o:"07:30 PM",h:9.5,t:4,c:1,p:88,status:"present",late:false},
-{d:"2026-04-30",i:"09:45 AM",o:"06:45 PM",h:9.0,t:5,c:0,p:85,status:"present",late:false},
-{d:"2026-04-29",i:"10:10 AM",o:"07:00 PM",h:8.8,t:4,c:1,p:82,status:"present",late:true},
-{d:"2026-04-28",i:"09:50 AM",o:"07:15 PM",h:9.4,t:6,c:0,p:90,status:"present",late:false},
-{d:"2026-04-25",i:"",o:"",h:0,t:0,c:0,p:0,status:"leave",late:false},
-{d:"2026-04-24",i:"10:00 AM",o:"07:00 PM",h:9.0,t:3,c:1,p:80,status:"present",late:false},
-{d:"2026-04-23",i:"09:55 AM",o:"07:30 PM",h:9.6,t:5,c:0,p:88,status:"present",late:false},
-]}});
-const FIN={revenue:48500000,expenses:31200000,profit:17300000,monthly:[{m:"Nov",r:7200000,e:5100000},{m:"Dec",r:8900000,e:5400000},{m:"Jan",r:8100000,e:5200000},{m:"Feb",r:7600000,e:4900000},{m:"Mar",r:9200000,e:5800000},{m:"Apr",r:7500000,e:4800000}],cats:[{n:"Salaries",a:18e6,p:57.7},{n:"Infra",a:55e5,p:17.6},{n:"Marketing",a:32e5,p:10.3},{n:"Office",a:25e5,p:8},{n:"Tools",a:12e5,p:3.8},{n:"Misc",a:8e5,p:2.6}],rec:[{name:"GrowthX Agency",mo:150000},{name:"DigitalEdge Co",mo:100000},{name:"BrandCraft Agency",mo:80000}]};
-
 /* COMPANY INFO — used in invoices */
 const COMPANY={name:"HTSyndicate Pvt Ltd",address:"Mumbai, Maharashtra, India 400001",email:"billing@htsyndicate.com",phone:"+91 98765 43210",gstin:"27AABCH1234A1Z5",pan:"AABCH1234A",bank:{name:"HDFC Bank",account:"5012XXXXXXXX",ifsc:"HDFC0001234",upi:"htsyndicate@hdfc"}};
 
-/* LEAVES */
-const mkLeaves=()=>[
-{id:uid(),by:"Zoe (Setter)",from:"2026-05-15",to:"2026-05-16",type:"casual",reason:"Family function",status:"pending",submittedAt:"2026-05-01T09:30:00"},
-{id:uid(),by:"Arjun (Closer)",from:"2026-04-28",to:"2026-04-28",type:"sick",reason:"Fever",status:"approved",submittedAt:"2026-04-27T08:00:00",decidedAt:"2026-04-27T09:00:00",decidedBy:"Sir (Admin)"},
-];
-
-/* BANK PAYMENTS — simulated webhook feed from connected bank */
-const mkBankPayments=()=>[
-{id:uid(),amount:50000,from:"Raj Malhotra",remarks:"GrowthX VIP token",receivedAt:"2026-05-01T14:00:00",method:"UPI",txnId:"UPI/410512345678",status:"linked",linkedLeadId:null,linkedInvoiceId:null,bankAccount:"HDFC ****1234"},
-{id:uid(),amount:1000000,from:"ScaleForce Inc",remarks:"INV HTS-001 Enterprise",receivedAt:"2026-04-05T10:00:00",method:"NEFT",txnId:"NEFT/N123456789",status:"linked",linkedLeadId:null,linkedInvoiceId:"HTS-001",bankAccount:"HDFC ****1234"},
-{id:uid(),amount:75000,from:"Unknown Sender",remarks:"From XYZ ABC123",receivedAt:"2026-05-02T08:30:00",method:"UPI",txnId:"UPI/410523456789",status:"unmatched",linkedLeadId:null,linkedInvoiceId:null,bankAccount:"HDFC ****1234"},
-{id:uid(),amount:150000,from:"GrowthX Agency",remarks:"April retainer",receivedAt:"2026-04-02T11:00:00",method:"NEFT",txnId:"NEFT/N987654321",status:"linked",linkedLeadId:null,linkedInvoiceId:"HTS-003",bankAccount:"HDFC ****1234"},
-];
-
-/* NOTIFICATIONS */
-const mkNotifications=()=>[
-{id:uid(),type:"new_lead",msg:"New lead: Alex Chen (NexaVentures) via Google Ads",at:"2026-05-02T10:45:00",read:false,for:"sales",linkTo:"sales"},
-{id:uid(),type:"payment",msg:"Payment received: ₹50,000 from Raj Malhotra (token)",at:"2026-05-01T14:00:00",read:false,for:"admin",linkTo:"finance"},
-{id:uid(),type:"leave",msg:"Zoe (Setter) requested leave for 2026-05-15 → 2026-05-16",at:"2026-05-01T09:30:00",read:false,for:"admin",linkTo:"leaves"},
-];
 
 /* ═══ LOGIN ═══ */
 function LoginPage(){
@@ -389,9 +301,9 @@ return(
 <div style={{minHeight:"100vh",background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:FONT,padding:20}}>
 <div style={{width:"100%",maxWidth:420,padding:32,background:T.s2,borderRadius:16,border:"1px solid "+T.bdr,boxShadow:"0 20px 60px rgba(0,0,0,.5)"}}>
 {/* Logo */}
-<div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}>
-<div style={{width:44,height:44,borderRadius:10,background:"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:16,fontWeight:800,color:"#000",fontFamily:MONO}}>HT</span></div>
-<div><div style={{fontSize:18,fontWeight:700,color:T.tx}}>HTSyndicate</div><div style={{fontSize:11,color:T.tx3}}>{mode==="signin"?"Welcome back":"Create your account"}</div></div>
+<div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:10,marginBottom:26}}>
+<img src="/logo.png" alt="HTSyndicate" style={{height:60,objectFit:"contain",display:"block"}}/>
+<div style={{fontSize:12,color:T.tx3}}>{mode==="signin"?"Welcome back":"Create your account"}</div>
 </div>
 
 {/* Tab switcher */}
@@ -418,27 +330,14 @@ return(
 <Inp label="Email" value={em} onChange={setEm} ph="you@htsyndicate.com" type="email"/>
 <Inp label="Password" value={pw} onChange={setPw} ph={mode==="signup"?"At least 6 characters":"Your password"} type="password"/>
 
-{mode==="signup"&&<>
-<Sel label="Role in Company" value={role} onChange={setRole} opts={[
-  {v:"admin",l:"Admin / Boss (full access)"},
-  {v:"sales",l:"Sales (setter or closer)"},
-  {v:"finance",l:"Finance / Accounting"},
-  {v:"tech",l:"Tech / Automations"}
-]}/>
-{role==="sales"&&<Sel label="Sales Position" value={subrole} onChange={setSubrole} opts={[
-  {v:"setter",l:"Setter (qualifies leads, books calls)"},
-  {v:"closer",l:"Closer (closes deals)"}
-]}/>}
-
+{/* No role picker — every signup joins as a least-privilege Setter.
+    Role can only be changed by an admin from the Team page. This is what
+    keeps open self-signup safe (see 0c trigger, which also forces setter). */}
+{mode==="signup"&&
 <div style={{padding:10,background:T.s1,borderRadius:6,fontSize:10,color:T.tx3,lineHeight:1.6}}>
-<div style={{fontWeight:600,color:T.tx2,marginBottom:3}}>Your access will be:</div>
-{role==="admin"&&"Full access to everything — sales, finance, automations, tasks, attendance, leaves"}
-{role==="sales"&&subrole==="setter"&&"Setter pipeline, lead sheet, calls, your tasks, leaves. Admin will be notified of your signup."}
-{role==="sales"&&subrole==="closer"&&"Closer pipeline, lead sheet, calls, your tasks, leaves. Admin will be notified of your signup."}
-{role==="finance"&&"Finance section (invoices, payments, bank), your tasks, leaves"}
-{role==="tech"&&"Automations dashboard, your tasks, leaves"}
-</div>
-</>}
+<div style={{fontWeight:600,color:T.tx2,marginBottom:3}}>Your access</div>
+You'll join as a <b style={{color:T.tx2}}>Setter</b> — pipeline, lead sheet, calls, your tasks, and leaves. An admin can promote you (Closer / Admin) from the Team page after you sign in.
+</div>}
 
 {err&&<div style={{fontSize:13,fontWeight:600,color:err.startsWith("Account created")?T.grn:T.red,padding:"12px 14px",background:err.startsWith("Account created")?T.grnBg:T.redBg,borderRadius:8,lineHeight:1.5,border:"1px solid "+(err.startsWith("Account created")?T.grn+"40":T.red+"40")}}>{err}</div>}
 
@@ -530,7 +429,7 @@ return(
 {/* TODAY */}
 {tab==="today"&&<Crd title={"Today — "+TODAY}>
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Employee","Dept","Status","Punch In","Punch Out","Hours","Tasks","Calls","Productivity","Late?"].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Employee","Dept","Status","Punch In","Punch Out","Hours","Tasks","Calls","Productivity","Late?"].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{Object.entries(punch).map(([n,p])=><tr key={n} style={{borderBottom:"1px solid "+T.bdr+"12"}}>
 <td style={{padding:8}}><div style={{display:"flex",alignItems:"center",gap:6}}><Av name={n} sz={24}/><span style={{fontWeight:500,color:T.tx,fontSize:11}}>{n}</span></div></td>
 <td style={{padding:8}}><Bd text={p.dept} color={p.dept==="sales"?"acc":p.dept==="finance"?"blu":"cyn"}/></td>
@@ -549,7 +448,7 @@ return(
 {/* FULL HISTORY */}
 {tab==="history"&&<Crd title="Attendance History (All Employees)">
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Date","Employee","Dept","Status","In","Out","Hours","Tasks","Calls","Prod%","Late"].map(h=><th key={h} style={{textAlign:"left",padding:"6px 7px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Date","Employee","Dept","Status","In","Out","Hours","Tasks","Calls","Prod%","Late"].map(h=><th key={h} style={{textAlign:"left",padding:"6px 7px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{allHist.sort((a,b)=>b.d.localeCompare(a.d)).map((h,idx)=><tr key={idx} style={{borderBottom:"1px solid "+T.bdr+"10",background:h.status==="absent"?T.redBg:h.status==="leave"?T.purBg:"transparent"}}>
 <td style={{padding:"6px 7px",fontFamily:MONO,color:T.tx2,fontSize:10}}>{h.d}</td>
 <td style={{padding:"6px 7px",fontWeight:500,color:T.tx}}>{h.name}</td>
@@ -587,7 +486,7 @@ return(
 {/* MONTHLY SUMMARY */}
 {tab==="monthly"&&<Crd title="Monthly Summary — April/May 2026">
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Employee","Days Present","Late Count","Leaves","Absences","Half Days","Total Hours","Avg Hours/Day","Avg Productivity","Score"].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Employee","Days Present","Late Count","Leaves","Absences","Half Days","Total Hours","Avg Hours/Day","Avg Productivity","Score"].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{Object.entries(punch).map(([n,p])=>{
 const present=p.hist.filter(h=>h.status==="present"||h.status==="halfday").length;
 const late=p.hist.filter(h=>h.late).length;
@@ -634,7 +533,7 @@ return(<Crd key={name} title={name+" — Detailed Log"}>
 ].map(s=><div key={s.l} style={{background:T.s1,borderRadius:5,padding:8,textAlign:"center"}}><div style={{fontSize:16,fontWeight:700,color:s.c,fontFamily:MONO}}>{s.v}</div><div style={{fontSize:8,color:T.tx3}}>{s.l}</div></div>)}
 </div>
 <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Date","Status","In","Out","Hours","Tasks","Calls","Prod","Late"].map(h=><th key={h} style={{textAlign:"left",padding:"6px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Date","Status","In","Out","Hours","Tasks","Calls","Prod","Late"].map(h=><th key={h} style={{textAlign:"left",padding:"6px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{p.hist.sort((a,b)=>b.d.localeCompare(a.d)).map((h,i)=><tr key={i} style={{borderBottom:"1px solid "+T.bdr+"10",background:h.status==="absent"?T.redBg:h.status==="leave"?T.purBg:""}}>
 <td style={{padding:6,fontFamily:MONO,color:T.tx2,fontSize:10}}>{h.d}</td>
 <td style={{padding:6}}><Bd text={h.status} color={h.status==="present"?"grn":h.status==="absent"?"red":h.status==="leave"?"pur":h.status==="halfday"?"acc":"def"}/></td>
@@ -724,6 +623,16 @@ const isAdmin=subrole==="admin";
 const isSetter=subrole==="setter";
 const isCloser=subrole==="closer";
 const canEdit=true;
+/* Live stage label/color lookup — uses the dynamic (persisted) stage lists, not the
+   module-level defaults, so custom stages render their name/color everywhere (table,
+   detail badge, history, notifications), not just as kanban columns. */
+const stL=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===s)?.l||s;
+const stC=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===s)?.c||T.tx3;
+/* Stage label/color WITH default fallback — used by the global search panel, where a
+   matched lead may live in a pipeline whose custom stages aren't currently loaded.
+   Stage ids are shared across pipelines, so the defaults resolve a sensible label/color. */
+const stLd=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===s)?.l||(kind==="closer"?DEFAULT_CLOSER_STAGES:DEFAULT_SETTER_STAGES).find(x=>x.id===s)?.l||s;
+const stCd=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===s)?.c||(kind==="closer"?DEFAULT_CLOSER_STAGES:DEFAULT_SETTER_STAGES).find(x=>x.id===s)?.c||T.tx3;
 /* Default view by role */
 const defaultView=isSetter?"setter":isCloser?"closer":"setter";
 const[vw,setVw]=useState(defaultView);
@@ -733,6 +642,9 @@ const[showLog,setShowLog]=useState(null);
 const[showPay,setShowPay]=useState(null);
 const[fSrc,setFSrc]=useState("All");
 const[activePipeline,setActivePipeline]=useState("all");
+/* Tracks which (table:pipeline) seeds are in-flight/done this session so the auto-seed
+   below can't fire twice and create duplicate columns. See loadStagesForPipeline effect. */
+const seedingRef=useRef(new Set());
 const[showAddPipeline,setShowAddPipeline]=useState(false);
 const[showAddStage,setShowAddStage]=useState(null);
 const[showEditStage,setShowEditStage]=useState(null);/* {kind, stage} */
@@ -746,12 +658,60 @@ const[adminView,setAdminView]=useState("setter");
 /* Drag state — { kind: "lead"|"stage", id, fromStage, kind2 } */
 const[drag,setDrag]=useState(null);
 const[search,setSearch]=useState("");
+/* Active call: {lead, startedAt} | null */
+const[activeCall,setActiveCall]=useState(null);
 
 /* Filter leads by active pipeline */
 const curPipeline=pipelines.find(p=>p.id===activePipeline)||pipelines[0];
+/* Stages are per-pipeline. "all" is an aggregate view → show the default set
+   read-only (every lead uses shared stage ids like "new"/"won", so it still
+   renders). Only a specific pipeline can add / edit / delete / reorder stages. */
+const stagesEditable=activePipeline!=="all";
+/* Diagnostic: surface pipeline/stage state on every change so the console
+   shows exactly why the Add/Edit/Delete/Drag controls are or aren't enabled. */
+useEffect(()=>{console.log('[stages diag]',{activePipeline,stagesEditable,curPipeline:curPipeline?.id,curPipelineName:curPipeline?.name,pipelinesLoaded:pipelines.length,hasAllInList:pipelines.some(p=>p.id==="all"),setterStagesCount:setterStages.length,closerStagesCount:closerStages.length})},[activePipeline,stagesEditable,pipelines,setterStages.length,closerStages.length]);
+/* Load — and auto-seed — this pipeline's stages whenever the active pipeline changes.
+   The seed is guarded so it runs at most once per (table, pipeline): React StrictMode
+   double-invokes effects and rapid pipeline switches used to fire several concurrent
+   inserts before the first finished, producing duplicate columns (e.g. 4× "New Lead"). */
+useEffect(()=>{
+  let cancelled=false;
+  const pid=activePipeline;
+  if(!pid||pid==="all"){setSetterStages(DEFAULT_SETTER_STAGES);setCloserStages(DEFAULT_CLOSER_STAGES);return;}
+  const loadKind=async(tbl,defaults,setStages)=>{
+    const{data,error}=await supabase.from(tbl).select('*').eq('pipeline_id',pid).order('sort_order');
+    if(cancelled)return;
+    if(error){console.error('[loadStagesForPipeline] load failed — using defaults',{tbl,pid,error});setStages(defaults);return;}
+    if(data&&data.length){setStages(data.map(s=>({id:s.id,l:s.label,c:s.color})));return;}
+    /* No stages saved for this pipeline yet → seed from the defaults so the board isn't blank. */
+    setStages(defaults);
+    /* Guard 1 — skip if a seed for this table+pipeline is already in flight / done this session. */
+    const seedKey=tbl+':'+pid;
+    if(seedingRef.current.has(seedKey))return;
+    seedingRef.current.add(seedKey);
+    /* Guard 2 — re-check the live row count right before inserting and only seed when it's
+       exactly 0, so we never seed a pipeline another tab/client just populated. */
+    const{count,error:cntErr}=await supabase.from(tbl).select('id',{count:'exact',head:true}).eq('pipeline_id',pid);
+    if(cancelled)return;
+    if(cntErr){console.error('[loadStagesForPipeline] count check failed — skipping seed',{tbl,pid,cntErr});seedingRef.current.delete(seedKey);return;}
+    if(count&&count>0){
+      const{data:fresh}=await supabase.from(tbl).select('*').eq('pipeline_id',pid).order('sort_order');
+      if(!cancelled&&fresh&&fresh.length)setStages(fresh.map(s=>({id:s.id,l:s.label,c:s.color})));
+      return;
+    }
+    const rows=defaults.map((s,i)=>({id:s.id,label:s.l,color:s.c,sort_order:i,pipeline_id:pid}));
+    const{error:seedErr}=await supabase.from(tbl).insert(rows);
+    if(seedErr){console.error('[loadStagesForPipeline] auto-seed failed — likely add-pipeline-id-to-stages.sql has not been run in Supabase yet (missing pipeline_id column)',{tbl,pid,seedErr});seedingRef.current.delete(seedKey);}
+    else console.log('[loadStagesForPipeline] seeded defaults for pipeline',{tbl,pid,count:rows.length});
+  };
+  loadKind('setter_stages',DEFAULT_SETTER_STAGES,setSetterStages);
+  loadKind('closer_stages',DEFAULT_CLOSER_STAGES,setCloserStages);
+  return()=>{cancelled=true;};
+},[activePipeline]);
 const pipelineLeads=useMemo(()=>{
-  if(!curPipeline||curPipeline.id==="all"||curPipeline.sources.length===0)return leads;
-  return leads.filter(l=>curPipeline.sources.includes(l.source));
+  if(!curPipeline||curPipeline.id==="all")return leads;
+  const sources=curPipeline.sources||[];
+  return leads.filter(l=>(l.pipeline||"").toLowerCase()===curPipeline.id.toLowerCase()||sources.includes(l.source));
 },[leads,curPipeline]);
 
 /* Compute live heat for each lead — uses pipelineLeads */
@@ -773,6 +733,14 @@ const filteredLeads=useMemo(()=>{
   return leadsHydrated.filter(l=>(l.name||"").toLowerCase().includes(q)||(l.phone||"").toLowerCase().includes(q)||(l.email||"").toLowerCase().includes(q)||(l.company||"").toLowerCase().includes(q));
 },[leadsHydrated,search]);
 const filteredCloserLeads=useMemo(()=>filteredLeads.filter(l=>l.closerStage),[filteredLeads]);
+/* Global search — matches across ALL leads/pipelines (not just the active one) so the
+   results panel can surface which pipeline + stage each matched lead sits in. */
+const globalResults=useMemo(()=>{
+  const q=search.trim().toLowerCase();
+  if(!q)return[];
+  return leads.filter(l=>(l.name||"").toLowerCase().includes(q)||(l.phone||"").toLowerCase().includes(q)||(l.email||"").toLowerCase().includes(q)||(l.company||"").toLowerCase().includes(q))
+    .map(l=>({lead:l,pipe:(pipelines||[]).find(p=>p.id!=="all"&&((l.pipeline||"").toLowerCase()===p.id.toLowerCase()||(p.sources||[]).includes(l.source))),cash:(l.payments||[]).reduce((a,p)=>a+(Number(p.amount)||0),0)}));
+},[leads,pipelines,search]);
 const won=leadsHydrated.filter(l=>l.setterStage==="won"),
       active=leadsHydrated.filter(l=>!["won","lost"].includes(l.setterStage)),
       whop=leadsHydrated.filter(l=>l.source==="Whop (Course Buyer)");
@@ -780,7 +748,7 @@ const won=leadsHydrated.filter(l=>l.setterStage==="won"),
 /* Time period filter for progress tracking */
 const[period,setPeriod]=useState("month");/* day | week | month */
 const periodStart=useMemo(()=>{
-  const d=new Date(NOW_TS);
+  const d=new Date();
   if(period==="day")return new Date(d.setHours(0,0,0,0)).getTime();
   if(period==="week"){const day=d.getDay();return new Date(d.setDate(d.getDate()-day)).setHours(0,0,0,0)}
   return new Date(d.getFullYear(),d.getMonth(),1).getTime();
@@ -841,7 +809,10 @@ const moveSetter=(id,stg,by)=>{
       updated.closerStage="new";
       updated.closerHistory=[...(l.closerHistory||[]),{stage:"new",at:new Date().toISOString(),by:"System (handed off from "+by+")"}];
     }
-    supabase.from('leads').update(leadToDb(updated)).eq('id',id);
+    saveLead(updated);
+    if(l.setterStage!==stg)notifyStageChange({name:l.name,stage:stL(stg,"setter"),leadId:l.id,pipeline:l.pipeline||l.source});
+    /* Keep the open detail panel in sync so the stage selection registers visually. */
+    if(sel?.id===id)setSel(prev=>({...prev,...updated}));
     return updated;
   }));
 };
@@ -850,12 +821,16 @@ const moveCloser=(id,stg,by)=>{
     if(l.id!==id)return l;
     const newH=[...(l.closerHistory||[]),{stage:stg,at:new Date().toISOString(),by:by||"Manual"}];
     const updated={...l,closerStage:stg,closerHistory:newH};
-    supabase.from('leads').update(leadToDb(updated)).eq('id',id);
+    saveLead(updated);
+    if(l.closerStage!==stg)notifyStageChange({name:l.name,stage:stL(stg,"closer"),leadId:l.id,pipeline:l.pipeline||l.source});
+    /* Keep the open detail panel in sync so the stage selection registers visually. */
+    if(sel?.id===id)setSel(prev=>({...prev,...updated}));
     return updated;
   }));
 };
 /* Reorder stages by dragging columns */
 const reorderStages=(kind,fromId,toId)=>{
+  if(!stagesEditable)return;
   const setter=kind==="setter";
   const list=setter?setterStages:closerStages;
   const fromIdx=list.findIndex(s=>s.id===fromId);
@@ -866,19 +841,21 @@ const reorderStages=(kind,fromId,toId)=>{
   newList.splice(toIdx,0,moved);
   if(setter)setSetterStages(newList);else setCloserStages(newList);
   const tbl=setter?'setter_stages':'closer_stages';
-  newList.forEach((s,i)=>supabase.from(tbl).update({sort_order:i}).eq('id',s.id));
+  newList.forEach((s,i)=>supabase.from(tbl).update({sort_order:i}).eq('id',s.id).eq('pipeline_id',activePipeline).then(({error})=>{if(error)console.error('Stage reorder save failed',{tbl,id:s.id,error})}));
 };
 /* Edit a stage — change name and color */
 const editStage=(kind,stageId,patch)=>{
+  if(!stagesEditable)return;
   const tbl=kind==="setter"?'setter_stages':'closer_stages';
   if(kind==="setter")setSetterStages(prev=>prev.map(s=>s.id===stageId?{...s,...patch}:s));
   else setCloserStages(prev=>prev.map(s=>s.id===stageId?{...s,...patch}:s));
   /* patch has {l, c} — map to DB {label, color} */
   const dbPatch={};if(patch.l)dbPatch.label=patch.l;if(patch.c)dbPatch.color=patch.c;
-  supabase.from(tbl).update(dbPatch).eq('id',stageId);
+  supabase.from(tbl).update(dbPatch).eq('id',stageId).eq('pipeline_id',activePipeline).then(({error})=>{if(error){console.error('[editStage] Supabase update FAILED',{tbl,stageId,pipeline:activePipeline,error});const m=(error.message||'')+(error.code?' ['+error.code+']':'');const hint=/pipeline_id|does not exist|42703/i.test(m)?'\n\nThe stages tables are missing the per-pipeline column. Run add-pipeline-id-to-stages.sql in Supabase.':'';alert('Could not save stage change: '+(error.message||error.code||'unknown error')+hint)}else console.log('[editStage] Supabase update OK',{tbl,stageId})});
 };
 /* Delete a stage — moves all its leads to the first remaining stage */
 const deleteStage=(kind,stageId)=>{
+  if(!stagesEditable)return;
   const setter=kind==="setter";
   const list=setter?setterStages:closerStages;
   if(list.length<=1){alert("Cannot delete the only stage. Add another stage first.");return}
@@ -886,20 +863,46 @@ const deleteStage=(kind,stageId)=>{
   const fallback=remaining[0].id;
   const tbl=setter?'setter_stages':'closer_stages';
   setLeads(p=>p.map(l=>{
-    if(setter&&l.setterStage===stageId){const u={...l,setterStage:fallback,setterHistory:[...(l.setterHistory||[]),{stage:fallback,at:new Date().toISOString(),by:"System (stage deleted)"}]};supabase.from('leads').update(leadToDb(u)).eq('id',l.id);return u;}
-    if(!setter&&l.closerStage===stageId){const u={...l,closerStage:fallback,closerHistory:[...(l.closerHistory||[]),{stage:fallback,at:new Date().toISOString(),by:"System (stage deleted)"}]};supabase.from('leads').update(leadToDb(u)).eq('id',l.id);return u;}
+    if(setter&&l.setterStage===stageId){const u={...l,setterStage:fallback,setterHistory:[...(l.setterHistory||[]),{stage:fallback,at:new Date().toISOString(),by:"System (stage deleted)"}]};saveLead(u);return u;}
+    if(!setter&&l.closerStage===stageId){const u={...l,closerStage:fallback,closerHistory:[...(l.closerHistory||[]),{stage:fallback,at:new Date().toISOString(),by:"System (stage deleted)"}]};saveLead(u);return u;}
     return l;
   }));
   if(setter)setSetterStages(remaining);else setCloserStages(remaining);
-  supabase.from(tbl).delete().eq('id',stageId);
+  console.log('[deleteStage] DELETE from Supabase',{tbl,stageId,pipeline:activePipeline});
+  supabase.from(tbl).delete().eq('id',stageId).eq('pipeline_id',activePipeline).then(({error})=>{
+    if(error){console.error('[deleteStage] Supabase delete FAILED — stage will reappear on refresh',{tbl,stageId,pipeline:activePipeline,error});const m=(error.message||'')+(error.code?' ['+error.code+']':'');const hint=/pipeline_id|does not exist|42703/i.test(m)?'\n\nThe stages tables are missing the per-pipeline column. Run add-pipeline-id-to-stages.sql in Supabase.':/relation.*does not exist|42P01/i.test(m)?'\n\nThe stages table is missing. Run fix-crm-persistence.sql then add-pipeline-id-to-stages.sql.':'\n\nIt will reappear after refresh — likely RLS on '+tbl+'.';alert('Could not delete the stage: '+(error.message||error.code||'unknown error')+hint);}
+    else console.log('[deleteStage] Supabase delete OK',{tbl,stageId});
+  });
 };
 /* Edit lead — admin only */
 const updateLead=(id,patch)=>{
-  setLeads(p=>p.map(l=>{if(l.id!==id)return l;const u={...l,...patch};supabase.from('leads').update(leadToDb(u)).eq('id',id);return u;}));
+  setLeads(p=>p.map(l=>{
+    if(l.id!==id)return l;
+    const u={...l,...patch};
+    saveLead(u);
+    /* Activity pushes — only when the field actually changed to a real value. */
+    if(patch.setter&&patch.setter!==l.setter)notifyAssignment({name:l.name,member:patch.setter,role:"setter",leadId:l.id,pipeline:u.pipeline||u.source});
+    if(patch.closer&&patch.closer!==l.closer)notifyAssignment({name:l.name,member:patch.closer,role:"closer",leadId:l.id,pipeline:u.pipeline||u.source});
+    if(patch.pipeline&&patch.pipeline!==l.pipeline)notifyStageChange({name:l.name,stage:patch.pipeline,leadId:l.id,pipeline:patch.pipeline});
+    return u;
+  }));
   if(sel?.id===id)setSel(p=>({...p,...patch}));
 };
 const addCall=(id,dur,out,by)=>{
-  setLeads(p=>p.map(l=>{if(l.id!==id)return l;const u={...l,calls:l.calls+1,callLogs:[...l.callLogs,{date:new Date().toISOString(),dur:+dur,out:out,by:by||"Team"}]};supabase.from('leads').update({calls:u.calls,call_logs:u.callLogs}).eq('id',id);return u;}));
+  setLeads(p=>p.map(l=>{
+    if(l.id!==id)return l;
+    const u={...l,calls:l.calls+1,callLogs:[...l.callLogs,{date:new Date().toISOString(),dur:+dur,out:out,by:by||"Team"}]};
+    supabase.from('leads').update({calls:u.calls,call_logs:u.callLogs}).eq('id',id).then(({error})=>{
+      if(error){
+        console.error('addCall save failed',{id,error});
+        alert('Failed to save call to database: '+(error.message||'unknown error'));
+        return;
+      }
+      console.log('addCall saved',{id,calls:u.calls,logs:u.callLogs.length});
+    });
+    notifyCallLogged({name:l.name,outcome:out,by:by||"Team",leadId:l.id,pipeline:l.pipeline||l.source});
+    return u;
+  }));
 };
 const addPayment=(id,amount,what,type)=>{
   setLeads(p=>p.map(l=>{
@@ -909,6 +912,9 @@ const addPayment=(id,amount,what,type)=>{
     if(type==="token"&&!l.tokenPaidAt)updated.tokenPaidAt=pmt.date;
     if(!l.firstPaidAt)updated.firstPaidAt=pmt.date;
     supabase.from('leads').update(leadToDb(updated)).eq('id',id);
+    notifyPayment({name:l.name,amount:+amount,type:type,leadId:l.id,pipeline:l.pipeline||l.source});
+    /* A token payment makes the lead hot for 48h (see calcHeat) — flag it. */
+    if(type==="token")notifyHotLead({name:l.name,reason:"Token paid · hot for 48h",leadId:l.id,pipeline:l.pipeline||l.source});
     return updated;
   }));
 };
@@ -925,12 +931,44 @@ return(
 </div>
 
 {/* SEARCH BAR */}
-<div style={{display:"flex",alignItems:"center",gap:8,background:T.s3,borderRadius:8,border:"1px solid "+(search?T.acc:T.bdr),padding:"8px 12px"}}>
-<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={search?T.acc:T.tx3} strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
-<input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search by name, phone, email, company…" style={{background:"transparent",border:"none",outline:"none",color:T.tx,fontSize:12,fontFamily:FONT,flex:1,minWidth:200}}/>
+<div style={{display:"flex",alignItems:"center",gap:8,height:36,background:T.s2,borderRadius:10,border:"1px solid "+(search?T.acc:T.bdr),padding:"0 12px",transition:"border-color .15s ease"}}>
+<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={search?T.acc:T.tx3} strokeWidth="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+<input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search by name, phone, email, company…" style={{background:"transparent",border:"none",outline:"none",color:T.tx,fontSize:13,fontFamily:FONT,flex:1,minWidth:200}}/>
 {search&&<button onClick={()=>setSearch("")} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center",fontSize:14,lineHeight:1}}>×</button>}
-{search&&<span style={{fontSize:10,color:T.acc,fontFamily:MONO,fontWeight:600,whiteSpace:"nowrap"}}>{filteredLeads.length} result{filteredLeads.length!==1?"s":""}</span>}
+{search&&<span style={{fontSize:10,color:T.acc,fontFamily:MONO,fontWeight:600,whiteSpace:"nowrap"}}>{globalResults.length} result{globalResults.length!==1?"s":""}</span>}
 </div>
+
+{/* GLOBAL SEARCH RESULTS — shows the pipeline + setter/closer stage for every match across all pipelines */}
+{search.trim()&&<div style={{background:T.s2,borderRadius:10,border:"1px solid "+T.bdr,overflow:"hidden"}}>
+<div style={{padding:"10px 14px",borderBottom:"1px solid "+T.bdr,display:"flex",alignItems:"center",gap:8}}>
+<span style={{fontSize:12,fontWeight:600,color:T.tx}}>Search results</span>
+<span style={{fontSize:10,fontFamily:MONO,color:T.tx3}}>{globalResults.length} across all pipelines</span>
+</div>
+<div style={{maxHeight:360,overflowY:"auto"}}>
+{globalResults.length===0?<div style={{padding:"24px",textAlign:"center",fontSize:12,color:T.tx3}}>No leads match "{search}"</div>:globalResults.map(({lead:l,pipe,cash})=>(
+<div key={l.id} onClick={()=>setSel(l)}
+  style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderBottom:"1px solid "+T.bdr+"30",cursor:"pointer",transition:"background .15s"}}
+  onMouseEnter={e=>e.currentTarget.style.background=T.s3}
+  onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+<Av name={l.name} sz={28}/>
+<div style={{flex:1,minWidth:0}}>
+<div style={{fontSize:12,fontWeight:600,color:T.tx,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{l.name}</div>
+<div style={{fontSize:10,color:T.tx3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{l.email||l.phone||l.company||l.source||"—"}</div>
+</div>
+<div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
+{/* Pipeline badge */}
+<span style={{display:"inline-flex",alignItems:"center",gap:5,padding:"3px 9px",borderRadius:5,fontSize:10,fontWeight:600,background:(pipe?.color||T.tx3)+"18",color:pipe?.color||T.tx3,border:"1px solid "+(pipe?.color||T.tx3)+"40",whiteSpace:"nowrap"}}>
+{pipe&&<Ic t={pipe.icon} s={11} c={pipe.color||T.tx3}/>}{pipe?.name||"Unassigned"}
+</span>
+{/* Setter stage badge */}
+{l.setterStage&&<span title="Setter stage" style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 9px",borderRadius:5,fontSize:9,fontWeight:700,letterSpacing:.3,textTransform:"uppercase",background:stCd(l.setterStage,"setter")+"18",color:stCd(l.setterStage,"setter"),border:"1px solid "+stCd(l.setterStage,"setter")+"40",whiteSpace:"nowrap"}}><span style={{opacity:.55,fontSize:8}}>S</span>{stLd(l.setterStage,"setter")}</span>}
+{/* Closer stage badge (only once handed off) */}
+{l.closerStage&&<span title="Closer stage" style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 9px",borderRadius:5,fontSize:9,fontWeight:700,letterSpacing:.3,textTransform:"uppercase",background:stCd(l.closerStage,"closer")+"18",color:stCd(l.closerStage,"closer"),border:"1px solid "+stCd(l.closerStage,"closer")+"40",whiteSpace:"nowrap"}}><span style={{opacity:.55,fontSize:8}}>C</span>{stLd(l.closerStage,"closer")}</span>}
+{cash>0&&<span style={{fontFamily:MONO,fontSize:10,fontWeight:700,color:T.grn,whiteSpace:"nowrap"}}>{fS(cash)}</span>}
+</div>
+</div>))}
+</div>
+</div>}
 
 {/* GHL-STYLE PIPELINE TOOLBAR */}
 <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
@@ -944,8 +982,7 @@ return(
 <Ic t={showPipelineDropdown?"aUp":"aDown"} s={12} c={T.tx3}/>
 </button>
 {showPipelineDropdown&&<div style={{position:"absolute",top:"calc(100% + 4px)",left:0,minWidth:280,background:T.s2,border:"1px solid "+T.bdr,borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,.4)",zIndex:50,overflow:"hidden"}}>
-{pipelines.map(p=>{const cnt=p.id==="all"||p.sources.length===0?leads.length:leads.filter(l=>p.sources.includes(l.source)).length;const isActive=activePipeline===p.id;return(
-<button key={p.id} onClick={()=>{setActivePipeline(p.id);setShowPipelineDropdown(false)}} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",width:"100%",background:isActive?T.accBg:"transparent",color:isActive?T.acc:T.tx,border:"none",borderBottom:"1px solid "+T.bdr+"40",cursor:"pointer",fontSize:12,fontFamily:FONT,fontWeight:isActive?600:500,textAlign:"left"}}>
+{pipelines.map(p=>{const sources=p.sources||[];const cnt=p.id==="all"?leads.length:leads.filter(l=>(l.pipeline||"").toLowerCase()===p.id.toLowerCase()||sources.includes(l.source)).length;const isActive=activePipeline===p.id;return(<button key={p.id} onClick={()=>{setActivePipeline(p.id);setShowPipelineDropdown(false)}} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",width:"100%",background:isActive?T.accBg:"transparent",color:isActive?T.acc:T.tx,border:"none",borderBottom:"1px solid "+T.bdr+"40",cursor:"pointer",fontSize:12,fontFamily:FONT,fontWeight:isActive?600:500,textAlign:"left"}}>
 <Ic t={p.icon} s={14} c={isActive?T.acc:p.color||T.tx3}/>
 <span style={{flex:1}}>{p.name}</span>
 <span style={{fontSize:10,fontFamily:MONO,color:T.tx3}}>{cnt}</span>
@@ -987,7 +1024,6 @@ const allTabs=[
 {id:"sheet",l:"Lead Sheet",roles:["admin","setter","closer"]},
 {id:"calls",l:"Calls",roles:["admin","setter","closer"]},
 {id:"daily",l:"Daily Report",roles:["admin"]},
-{id:"whop",l:"Whop",roles:["admin","setter","closer"]},
 {id:"team",l:"Team Stats",roles:["admin"]},
 {id:"src",l:"Sources",roles:["admin","setter","closer"]}
 ];
@@ -1005,7 +1041,7 @@ return allTabs.filter(t=>{
 {/* Setter header with progress switcher */}
 <div style={{background:T.s3,borderRadius:10,border:"1px solid "+T.bdr,padding:"14px 18px"}}>
 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,marginBottom:12}}>
-<div><div style={{fontSize:13,fontWeight:600,color:T.tx,marginBottom:2}}>Setter — Zoe</div>
+<div><div style={{fontSize:13,fontWeight:600,color:T.tx,marginBottom:2}}>{user?.subrole==="setter"&&user?.name?"Setter — "+user.name:"Setter Pipeline"}</div>
 <div style={{fontSize:10,color:T.tx3}}>Books calls, qualifies, hands off to closer</div></div>
 <div style={{display:"flex",gap:0,background:T.s1,borderRadius:7,padding:3,border:"1px solid "+T.bdr}}>
 {[{id:"day",l:"Today"},{id:"week",l:"This Week"},{id:"month",l:"This Month"}].map(p=><button key={p.id} onClick={()=>setPeriod(p.id)} style={{padding:"5px 12px",borderRadius:5,fontSize:10,fontWeight:period===p.id?700:500,background:period===p.id?T.acc:"transparent",color:period===p.id?"#000":T.tx2,border:"none",cursor:"pointer",fontFamily:FONT}}>{p.l}</button>)}
@@ -1031,17 +1067,17 @@ return allTabs.filter(t=>{
 <div key={st.id}
   onDragOver={e=>{e.preventDefault();e.dataTransfer.dropEffect="move"}}
   onDrop={e=>{e.preventDefault();if(drag?.type==="stage"&&drag.kind==="setter")reorderStages("setter",drag.id,st.id);else if(drag?.type==="lead"&&drag.kind==="setter")moveSetter(drag.id,st.id,user?.name?.split(" ")[0]||"Manual");setDrag(null)}}
-  style={{minWidth:280,width:280,flexShrink:0,background:T.s2,borderRadius:8,border:"1px solid "+(drag?.type==="lead"&&drag?.kind==="setter"?st.c+"60":T.bdr),display:"flex",flexDirection:"column"}}>
+  style={{minWidth:280,width:280,flexShrink:0,background:"transparent",borderRadius:12,border:"1px solid "+(drag?.type==="lead"&&drag?.kind==="setter"?T.acc:"transparent"),display:"flex",flexDirection:"column"}}>
 {/* GHL-style stage header */}
 <div
-  draggable
-  onDragStart={e=>{setDrag({type:"stage",kind:"setter",id:st.id});e.dataTransfer.effectAllowed="move"}}
-  style={{padding:"14px 16px",borderBottom:"1px solid "+T.bdr,cursor:"move",position:"relative"}}>
+  draggable={stagesEditable}
+  onDragStart={e=>{if(!stagesEditable)return;setDrag({type:"stage",kind:"setter",id:st.id});e.dataTransfer.effectAllowed="move"}}
+  style={{padding:"14px 16px",borderBottom:"1px solid "+T.bdr,cursor:stagesEditable?"move":"default",position:"relative"}}>
 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
-<span style={{fontSize:14,fontWeight:600,color:T.tx,letterSpacing:-.2}}>{st.l}</span>
+<span style={{display:"inline-flex",alignItems:"center",gap:8}}><span style={{fontSize:13,fontWeight:600,color:T.tx2,textTransform:"uppercase",letterSpacing:.8}}>{st.l}</span><span style={{fontSize:11,fontWeight:600,color:T.tx3,background:T.s2,borderRadius:10,minWidth:18,height:20,padding:"0 7px",display:"inline-flex",alignItems:"center",justifyContent:"center"}}>{sL.length}</span></span>
 <div style={{display:"flex",alignItems:"center",gap:8}}>
-<button onClick={e=>{e.stopPropagation();setShowEditStage({kind:"setter",stage:st})}} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Edit stage"><Ic t="edit" s={12} c={T.tx3}/></button>
-<button onClick={e=>{e.stopPropagation();const cnt=leadsHydrated.filter(l=>l.setterStage===st.id).length;const msg=cnt>0?"Delete stage \""+st.l+"\"? "+cnt+" lead"+(cnt>1?"s":"")+" will be moved to the first stage.":"Delete stage \""+st.l+"\"?";if(confirm(msg))deleteStage("setter",st.id)}} style={{background:"none",border:"none",color:T.red+"99",cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Delete stage"><Ic t="trash" s={12} c={T.red+"99"}/></button>
+{stagesEditable&&<><button onClick={e=>{e.stopPropagation();setShowEditStage({kind:"setter",stage:st})}} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Edit stage"><Ic t="edit" s={12} c={T.tx3}/></button>
+<button onClick={e=>{e.stopPropagation();const cnt=leadsHydrated.filter(l=>l.setterStage===st.id).length;const msg=cnt>0?"Delete stage \""+st.l+"\"? "+cnt+" lead"+(cnt>1?"s":"")+" will be moved to the first stage.":"Delete stage \""+st.l+"\"?";if(confirm(msg))deleteStage("setter",st.id)}} style={{background:"none",border:"none",color:T.red+"99",cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Delete stage"><Ic t="trash" s={12} c={T.red+"99"}/></button></>}
 <button title="Collapse" style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center"}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg></button>
 </div></div>
 <div style={{fontSize:12,color:T.tx3,fontWeight:500}}>{sL.length} {sL.length===1?"Opportunity":"Opportunities"} <span style={{color:T.tx2,marginLeft:4}}>{fS(stageVal)}</span></div>
@@ -1055,14 +1091,16 @@ return allTabs.filter(t=>{
   draggable
   onDragStart={e=>{e.stopPropagation();setDrag({type:"lead",kind:"setter",id:l.id,fromStage:st.id});e.dataTransfer.effectAllowed="move"}}
   onClick={()=>setSel(l)}
-  style={{background:T.s1,borderRadius:8,padding:"12px 14px",border:"1px solid "+T.bdr,cursor:"grab",opacity:drag?.id===l.id?.3:1,transition:"all .15s"}}
-  onMouseEnter={e=>{e.currentTarget.style.borderColor=T.acc+"50";e.currentTarget.style.transform="translateY(-1px)"}}
-  onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.transform="translateY(0)"}}>
+  style={{background:T.s1,borderRadius:12,padding:14,border:"1px solid "+T.bdr,cursor:"grab",opacity:drag?.id===l.id?.3:1,transition:"border-color .15s ease,transform .15s ease,box-shadow .15s ease"}}
+  onMouseEnter={e=>{e.currentTarget.style.borderColor="rgba(255,255,255,0.16)";e.currentTarget.style.transform="translateY(-1px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(0,0,0,0.4)"}}
+  onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="none"}}>
 {/* Stage tag + heat badge row */}
 <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:8,flexWrap:"wrap"}}>
 <span style={{display:"inline-flex",padding:"2px 8px",borderRadius:4,fontSize:9,fontWeight:700,background:st.c+"18",color:st.c,letterSpacing:.3,border:"1px solid "+st.c+"40",textTransform:"uppercase"}}>{st.l}</span>
-{l.heat==="hot"&&<Bd text="Hot" color="red"/>}
-{l.heat==="warm"&&<Bd text="Warm" color="yel"/>}
+{l.heat==="hot"&&<Bd text="Hot" color="red" solid/>}
+{l.heat==="warm"&&<Bd text="Warm" color="acc" solid/>}
+{l.heat==="cold"&&<Bd text="Cold" color="def" solid/>}
+{(l.tags||[]).map(t=><Bd key={t} text={t} color="pur"/>)}
 </div>
 {/* Lead name + person icon */}
 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
@@ -1076,7 +1114,7 @@ return allTabs.filter(t=>{
 </div>
 {/* Action icons row */}
 <div style={{display:"flex",alignItems:"center",gap:8,paddingTop:8,borderTop:"1px solid "+T.bdr+"60"}}>
-<div title={l.calls+" calls"} style={{position:"relative",display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="phone" s={13} c={T.tx3}/></div>
+<button onClick={e=>{e.stopPropagation();if(l.phone)setActiveCall({lead:l,startedAt:Date.now()})}} title={l.phone?"Call "+l.phone:"No phone number"} disabled={!l.phone} style={{position:"relative",display:"flex",alignItems:"center",justifyContent:"center",width:22,height:22,borderRadius:4,background:l.phone?T.grnBg:"transparent",border:"none",cursor:l.phone?"pointer":"not-allowed",padding:0}}><Ic t="phone" s={13} c={l.phone?T.grn:T.tx3}/>{l.calls>0&&<span style={{position:"absolute",top:-4,right:-4,background:T.acc,color:"#000",fontSize:8,fontWeight:700,fontFamily:MONO,minWidth:12,height:12,borderRadius:99,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 2px"}}>{l.calls}</span>}</button>
 <div title="Messages" style={{display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="mail" s={13} c={T.tx3}/></div>
 {wa&&<a href={wa} target="_blank" rel="noopener noreferrer" onClick={e=>e.stopPropagation()} title="WhatsApp" style={{display:"flex",alignItems:"center",justifyContent:"center",width:20,height:20,borderRadius:4,background:"#25D36618",cursor:"pointer",flexShrink:0,textDecoration:"none"}}><Ic t="wa" s={12} c="#25D366"/></a>}
 <div title={l.source} style={{display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="link" s={13} c={T.tx3}/></div>
@@ -1088,8 +1126,10 @@ return allTabs.filter(t=>{
 </div>
 </div>)})}</div></div>)})}
 {/* Add Stage button column */}
-<div style={{minWidth:120,width:120,flexShrink:0,display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:0}}>
-<button onClick={()=>setShowAddStage("setter")} style={{width:"100%",height:60,background:"transparent",border:"2px dashed "+T.bdr,borderRadius:8,color:T.tx3,cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:500,display:"flex",alignItems:"center",justifyContent:"center",gap:6,transition:"all .15s"}} onMouseEnter={e=>{e.currentTarget.style.borderColor=T.acc;e.currentTarget.style.color=T.acc}} onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.color=T.tx3}}><Ic t="plus" s={14}/>Add Stage</button>
+<div style={{minWidth:stagesEditable?120:180,width:stagesEditable?120:180,flexShrink:0,display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:0}}>
+{stagesEditable
+?<button onClick={()=>{console.log('[Add Stage click] setter',{activePipeline,stagesEditable});setShowAddStage("setter")}} style={{width:"100%",height:60,background:"transparent",border:"2px dashed "+T.bdr,borderRadius:8,color:T.tx3,cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:500,display:"flex",alignItems:"center",justifyContent:"center",gap:6,transition:"all .15s"}} onMouseEnter={e=>{e.currentTarget.style.borderColor=T.acc;e.currentTarget.style.color=T.acc}} onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.color=T.tx3}}><Ic t="plus" s={14}/>Add Stage</button>
+:<div style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px dashed "+T.bdr,color:T.tx3+"99",fontSize:10,lineHeight:1.4,textAlign:"center"}}>Stages are per pipeline. Switch to a specific pipeline to add or edit stages.</div>}
 </div>
 </div>
 </div>}
@@ -1098,7 +1138,7 @@ return allTabs.filter(t=>{
 {vw==="closer"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <div style={{background:T.s3,borderRadius:10,border:"1px solid "+T.bdr,padding:"14px 18px"}}>
 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,marginBottom:12}}>
-<div><div style={{fontSize:13,fontWeight:600,color:T.tx,marginBottom:2}}>Closer — Arjun</div>
+<div><div style={{fontSize:13,fontWeight:600,color:T.tx,marginBottom:2}}>{user?.subrole==="closer"&&user?.name?"Closer — "+user.name:"Closer Pipeline"}</div>
 <div style={{fontSize:10,color:T.tx3}}>Receives leads from setter, closes deals</div></div>
 <div style={{display:"flex",gap:0,background:T.s1,borderRadius:7,padding:3,border:"1px solid "+T.bdr}}>
 {[{id:"day",l:"Today"},{id:"week",l:"This Week"},{id:"month",l:"This Month"}].map(p=><button key={p.id} onClick={()=>setPeriod(p.id)} style={{padding:"5px 12px",borderRadius:5,fontSize:10,fontWeight:period===p.id?700:500,background:period===p.id?T.acc:"transparent",color:period===p.id?"#000":T.tx2,border:"none",cursor:"pointer",fontFamily:FONT}}>{p.l}</button>)}
@@ -1139,16 +1179,16 @@ return allTabs.filter(t=>{
 <div key={st.id}
   onDragOver={e=>{e.preventDefault();e.dataTransfer.dropEffect="move"}}
   onDrop={e=>{e.preventDefault();if(drag?.type==="stage"&&drag.kind==="closer")reorderStages("closer",drag.id,st.id);else if(drag?.type==="lead"&&drag.kind==="closer")moveCloser(drag.id,st.id,user?.name?.split(" ")[0]||"Manual");setDrag(null)}}
-  style={{minWidth:280,width:280,flexShrink:0,background:T.s2,borderRadius:8,border:"1px solid "+(drag?.type==="lead"&&drag?.kind==="closer"?st.c+"60":T.bdr),display:"flex",flexDirection:"column"}}>
+  style={{minWidth:280,width:280,flexShrink:0,background:"transparent",borderRadius:12,border:"1px solid "+(drag?.type==="lead"&&drag?.kind==="closer"?T.acc:"transparent"),display:"flex",flexDirection:"column"}}>
 <div
-  draggable
-  onDragStart={e=>{setDrag({type:"stage",kind:"closer",id:st.id});e.dataTransfer.effectAllowed="move"}}
-  style={{padding:"14px 16px",borderBottom:"1px solid "+T.bdr,cursor:"move",position:"relative"}}>
+  draggable={stagesEditable}
+  onDragStart={e=>{if(!stagesEditable)return;setDrag({type:"stage",kind:"closer",id:st.id});e.dataTransfer.effectAllowed="move"}}
+  style={{padding:"14px 16px",borderBottom:"1px solid "+T.bdr,cursor:stagesEditable?"move":"default",position:"relative"}}>
 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
-<span style={{fontSize:14,fontWeight:600,color:T.tx,letterSpacing:-.2}}>{st.l}</span>
+<span style={{display:"inline-flex",alignItems:"center",gap:8}}><span style={{fontSize:13,fontWeight:600,color:T.tx2,textTransform:"uppercase",letterSpacing:.8}}>{st.l}</span><span style={{fontSize:11,fontWeight:600,color:T.tx3,background:T.s2,borderRadius:10,minWidth:18,height:20,padding:"0 7px",display:"inline-flex",alignItems:"center",justifyContent:"center"}}>{sL.length}</span></span>
 <div style={{display:"flex",alignItems:"center",gap:8}}>
-<button onClick={e=>{e.stopPropagation();setShowEditStage({kind:"closer",stage:st})}} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Edit stage"><Ic t="edit" s={12} c={T.tx3}/></button>
-<button onClick={e=>{e.stopPropagation();const cnt=closerLeads.filter(l=>l.closerStage===st.id).length;const msg=cnt>0?"Delete stage \""+st.l+"\"? "+cnt+" lead"+(cnt>1?"s":"")+" will be moved to the first stage.":"Delete stage \""+st.l+"\"?";if(confirm(msg))deleteStage("closer",st.id)}} style={{background:"none",border:"none",color:T.red+"99",cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Delete stage"><Ic t="trash" s={12} c={T.red+"99"}/></button>
+{stagesEditable&&<><button onClick={e=>{e.stopPropagation();setShowEditStage({kind:"closer",stage:st})}} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Edit stage"><Ic t="edit" s={12} c={T.tx3}/></button>
+<button onClick={e=>{e.stopPropagation();const cnt=closerLeads.filter(l=>l.closerStage===st.id).length;const msg=cnt>0?"Delete stage \""+st.l+"\"? "+cnt+" lead"+(cnt>1?"s":"")+" will be moved to the first stage.":"Delete stage \""+st.l+"\"?";if(confirm(msg))deleteStage("closer",st.id)}} style={{background:"none",border:"none",color:T.red+"99",cursor:"pointer",padding:0,display:"flex",alignItems:"center"}} title="Delete stage"><Ic t="trash" s={12} c={T.red+"99"}/></button></>}
 <button title="Collapse" style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:0,display:"flex",alignItems:"center"}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6"/></svg></button>
 </div></div>
 <div style={{fontSize:12,color:T.tx3,fontWeight:500}}>{sL.length} {sL.length===1?"Opportunity":"Opportunities"} <span style={{color:T.tx2,marginLeft:4}}>{fS(stageVal)}</span></div>
@@ -1161,14 +1201,16 @@ return allTabs.filter(t=>{
   draggable
   onDragStart={e=>{e.stopPropagation();setDrag({type:"lead",kind:"closer",id:l.id,fromStage:st.id});e.dataTransfer.effectAllowed="move"}}
   onClick={()=>setSel(l)}
-  style={{background:T.s1,borderRadius:8,padding:"12px 14px",border:"1px solid "+T.bdr,cursor:"grab",opacity:drag?.id===l.id?.3:1,transition:"all .15s"}}
-  onMouseEnter={e=>{e.currentTarget.style.borderColor=T.acc+"50";e.currentTarget.style.transform="translateY(-1px)"}}
-  onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.transform="translateY(0)"}}>
+  style={{background:T.s1,borderRadius:12,padding:14,border:"1px solid "+T.bdr,cursor:"grab",opacity:drag?.id===l.id?.3:1,transition:"border-color .15s ease,transform .15s ease,box-shadow .15s ease"}}
+  onMouseEnter={e=>{e.currentTarget.style.borderColor="rgba(255,255,255,0.16)";e.currentTarget.style.transform="translateY(-1px)";e.currentTarget.style.boxShadow="0 4px 16px rgba(0,0,0,0.4)"}}
+  onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.transform="translateY(0)";e.currentTarget.style.boxShadow="none"}}>
 {/* Stage tag + heat badge row */}
 <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:8,flexWrap:"wrap"}}>
 <span style={{display:"inline-flex",padding:"2px 8px",borderRadius:4,fontSize:9,fontWeight:700,background:st.c+"18",color:st.c,letterSpacing:.3,border:"1px solid "+st.c+"40",textTransform:"uppercase"}}>{st.l}</span>
-{l.heat==="hot"&&<Bd text="Hot" color="red"/>}
-{l.heat==="warm"&&<Bd text="Warm" color="yel"/>}
+{l.heat==="hot"&&<Bd text="Hot" color="red" solid/>}
+{l.heat==="warm"&&<Bd text="Warm" color="acc" solid/>}
+{l.heat==="cold"&&<Bd text="Cold" color="def" solid/>}
+{(l.tags||[]).map(t=><Bd key={t} text={t} color="pur"/>)}
 </div>
 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
 <span style={{fontSize:13,fontWeight:600,color:T.tx}}>{l.name}</span>
@@ -1179,7 +1221,7 @@ return allTabs.filter(t=>{
 {l.value>0?(<><span>Value: </span><span style={{color:T.tx,fontWeight:600}}>{fS(l.value)}</span>{l.cashCollected>0&&<span style={{color:T.grn,marginLeft:6,fontSize:10}}>· {fS(l.cashCollected)} paid</span>}</>):<span style={{color:T.tx3,fontSize:10}}>No payment set</span>}
 </div>
 <div style={{display:"flex",alignItems:"center",gap:8,paddingTop:8,borderTop:"1px solid "+T.bdr+"60"}}>
-<div title={l.calls+" calls"} style={{position:"relative",display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="phone" s={13} c={T.tx3}/></div>
+<button onClick={e=>{e.stopPropagation();if(l.phone)setActiveCall({lead:l,startedAt:Date.now()})}} title={l.phone?"Call "+l.phone:"No phone number"} disabled={!l.phone} style={{position:"relative",display:"flex",alignItems:"center",justifyContent:"center",width:22,height:22,borderRadius:4,background:l.phone?T.grnBg:"transparent",border:"none",cursor:l.phone?"pointer":"not-allowed",padding:0}}><Ic t="phone" s={13} c={l.phone?T.grn:T.tx3}/>{l.calls>0&&<span style={{position:"absolute",top:-4,right:-4,background:T.acc,color:"#000",fontSize:8,fontWeight:700,fontFamily:MONO,minWidth:12,height:12,borderRadius:99,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 2px"}}>{l.calls}</span>}</button>
 <div title="Messages" style={{display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="mail" s={13} c={T.tx3}/></div>
 {wa&&<a href={wa} target="_blank" rel="noopener noreferrer" onClick={e=>e.stopPropagation()} title="WhatsApp" style={{display:"flex",alignItems:"center",justifyContent:"center",width:20,height:20,borderRadius:4,background:"#25D36618",cursor:"pointer",flexShrink:0,textDecoration:"none"}}><Ic t="wa" s={12} c="#25D366"/></a>}
 <div title={l.source} style={{display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="link" s={13} c={T.tx3}/></div>
@@ -1190,8 +1232,10 @@ return allTabs.filter(t=>{
 <div title="Calendar" style={{display:"flex",alignItems:"center",cursor:"pointer"}}><Ic t="cal" s={13} c={T.tx3}/></div>
 </div>
 </div>)})}</div></div>)})}
-<div style={{minWidth:120,width:120,flexShrink:0,display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:0}}>
-<button onClick={()=>setShowAddStage("closer")} style={{width:"100%",height:60,background:"transparent",border:"2px dashed "+T.bdr,borderRadius:8,color:T.tx3,cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:500,display:"flex",alignItems:"center",justifyContent:"center",gap:6,transition:"all .15s"}} onMouseEnter={e=>{e.currentTarget.style.borderColor=T.acc;e.currentTarget.style.color=T.acc}} onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.color=T.tx3}}><Ic t="plus" s={14}/>Add Stage</button>
+<div style={{minWidth:stagesEditable?120:180,width:stagesEditable?120:180,flexShrink:0,display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:0}}>
+{stagesEditable
+?<button onClick={()=>{console.log('[Add Stage click] closer',{activePipeline,stagesEditable});setShowAddStage("closer")}} style={{width:"100%",height:60,background:"transparent",border:"2px dashed "+T.bdr,borderRadius:8,color:T.tx3,cursor:"pointer",fontFamily:FONT,fontSize:12,fontWeight:500,display:"flex",alignItems:"center",justifyContent:"center",gap:6,transition:"all .15s"}} onMouseEnter={e=>{e.currentTarget.style.borderColor=T.acc;e.currentTarget.style.color=T.acc}} onMouseLeave={e=>{e.currentTarget.style.borderColor=T.bdr;e.currentTarget.style.color=T.tx3}}><Ic t="plus" s={14}/>Add Stage</button>
+:<div style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"1px dashed "+T.bdr,color:T.tx3+"99",fontSize:10,lineHeight:1.4,textAlign:"center"}}>Stages are per pipeline. Switch to a specific pipeline to add or edit stages.</div>}
 </div>
 </div>
 </div>}
@@ -1199,8 +1243,8 @@ return allTabs.filter(t=>{
 {/* LEAD SHEET */}
 {vw==="sheet"&&<Crd title="Lead Sheet" action={<select value={fSrc} onChange={e=>setFSrc(e.target.value)} style={{padding:"3px 8px",borderRadius:5,border:"1px solid "+T.bdr,background:T.inp,color:T.tx,fontSize:9}}><option value="All">All Sources</option>{SOURCES.map(s=><option key={s}>{s}</option>)}</select>}>
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Name","Company","Source","Heat","Setter Stage","Closer Stage","Value","LTV","Calls","Called?"].map(h=><th key={h} style={{textAlign:"left",padding:7,color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
-<tbody>{(fSrc==="All"?leadsHydrated:leadsHydrated.filter(l=>l.source===fSrc)).map(l=><tr key={l.id} onClick={()=>setSel(l)} style={{borderBottom:"1px solid "+T.bdr+"10",cursor:"pointer"}}>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Name","Company","Source","Heat","Setter Stage","Closer Stage","Value","LTV","Calls","Called?"].map(h=><th key={h} style={{textAlign:"left",padding:7,color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
+<tbody>{(fSrc==="All"?leadsHydrated:leadsHydrated.filter(l=>l.source===fSrc)).map(l=><tr key={l.id} onClick={()=>setSel(l)} onMouseEnter={e=>{e.currentTarget.style.background=T.s1}} onMouseLeave={e=>{e.currentTarget.style.background="transparent"}} style={{borderBottom:"1px solid "+T.bdr+"08",cursor:"pointer",transition:"background .12s ease"}}>
 <td style={{padding:7,color:T.tx,fontWeight:500}}>{l.name}</td><td style={{padding:7,color:T.tx2}}>{l.company}</td>
 <td style={{padding:7}}><Bd text={l.source.includes("Whop")?"Whop":l.source} color={l.source.includes("Whop")?"pur":"def"}/></td>
 <td style={{padding:7}}><Bd text={l.heat} color={heatColor(l.heat)}/></td>
@@ -1224,40 +1268,22 @@ return allTabs.filter(t=>{
 {/* DAILY REPORT */}
 {vw==="daily"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Crd title={"Daily Report — "+TODAY}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-{[{n:"Zoe (Setter)",r:"Setter"},{n:"Arjun (Closer)",r:"Closer"}].map(p=>{const pL=leadsHydrated.filter(l=>l.setter===p.n||l.closer===p.n);const tc=pL.flatMap(l=>l.callLogs).filter(c=>c.date>=TODAY);
-return(<div key={p.n} style={{background:T.s1,borderRadius:8,padding:14,border:"1px solid "+T.bdr}}>
-<div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}><Av name={p.n} sz={32}/><div><div style={{fontSize:13,fontWeight:600,color:T.tx}}>{p.n}</div><div style={{fontSize:10,color:T.tx3}}>{p.r}</div></div></div>
+{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(p=>{const pL=leadsHydrated.filter(l=>l.setter===p.name||l.closer===p.name);const tc=pL.flatMap(l=>l.callLogs).filter(c=>c.date>=TODAY);
+return(<div key={p.id} style={{background:T.s1,borderRadius:8,padding:14,border:"1px solid "+T.bdr}}>
+<div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}><Av name={p.name} sz={32}/><div><div style={{fontSize:13,fontWeight:600,color:T.tx}}>{p.name}</div><div style={{fontSize:10,color:T.tx3}}>{p.subrole==="setter"?"Setter":"Closer"}</div></div></div>
 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
 {[{v:pL.length,l:"Leads",c:T.tx},{v:tc.length,l:"Calls Today",c:T.cyn},{v:pL.filter(l=>l.heat==="hot").length,l:"Hot Now",c:T.red}].map(s=><div key={s.l} style={{background:T.s2,borderRadius:5,padding:8,textAlign:"center"}}><div style={{fontSize:16,fontWeight:700,color:s.c,fontFamily:MONO}}>{s.v}</div><div style={{fontSize:8,color:T.tx3}}>{s.l}</div></div>)}</div></div>)})}</div></Crd>
 <Crd title="Productivity Check" action={<Bd text="AI Assessment" color="pur"/>}>
-{[{n:"Zoe (Setter)",sc:88,r:"low",f:"Consistent calls, on time"},{n:"Arjun (Closer)",sc:76,r:"medium",f:"3 follow-ups pending, declining call duration"}].map(p=><div key={p.n} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid "+T.bdr+"12"}}>
-<span style={{fontSize:12,fontWeight:500,color:T.tx,width:130}}>{p.n}</span>
-<div style={{flex:1}}><Bar v={p.sc} max={100} color={p.sc>=80?T.grn:T.yel} h={4}/></div>
-<Bd text={p.r+" risk"} color={p.r==="low"?"grn":"yel"}/><span style={{fontFamily:MONO,fontWeight:700,color:p.sc>=80?T.grn:T.yel}}>{p.sc}%</span></div>)}</Crd></div>}
-
-{/* WHOP */}
-{vw==="whop"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
-<div style={{background:"linear-gradient(135deg,#1a0a2e,#2d1152)",borderRadius:10,border:"1px solid "+T.pur+"30",padding:"14px 18px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-<div style={{width:42,height:42,borderRadius:10,background:T.purBg,display:"flex",alignItems:"center",justifyContent:"center"}}><Ic t="whop" s={22} c={T.pur}/></div>
-<div style={{flex:1}}><div style={{fontSize:15,fontWeight:700,color:"#fff"}}>Whop Integration</div><div style={{fontSize:11,color:T.tx2}}>Course buyers auto-sync as leads for VIP upsell</div></div>
-<Bd text="Connected" color="grn"/></div>
-<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10}}>
-<St label="Course Buyers" value={whop.length} icon="users" color={T.pur}/>
-<St label="VIP Won" value={whop.filter(l=>l.setterStage==="won").length} icon="chk" color={T.grn}/>
-<St label="VIP Pipeline" value={fS(whop.filter(l=>!["won","lost"].includes(l.setterStage)).reduce((a,l)=>a+l.value,0))} icon="tgt" color={T.acc}/>
-<St label="Whop LTV" value={fS(whop.reduce((a,l)=>a+l.ltv,0))} icon="dollar" color={T.grn}/>
-</div>
-<Crd title="Whop Leads">{whop.map(l=><div key={l.id} onClick={()=>setSel(l)} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 0",borderBottom:"1px solid "+T.bdr+"12",cursor:"pointer"}}>
-<Av name={l.name} sz={28} color={"linear-gradient(135deg,"+T.pur+",#c084fc)"}/><div style={{flex:1}}><div style={{fontSize:12,fontWeight:600,color:T.tx}}>{l.name} <span style={{fontSize:9,color:T.tx3}}>({l.company})</span></div><div style={{fontSize:9,color:T.tx3}}>{l.calls} calls · Cash {fS(l.cashCollected)} · Rev {fS(l.revenue)}</div></div>
-<Bd text={l.heat} color={heatColor(l.heat)}/>
-<Bd text={stL(l.setterStage,"setter")} color={l.setterStage==="won"?"grn":"acc"}/><span style={{fontFamily:MONO,fontWeight:600,color:T.tx}}>{fS(l.value)}</span></div>)}</Crd></div>}
+{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(u=>{const pL=leadsHydrated.filter(l=>l.setter===u.name||l.closer===u.name);const sc=pL.length===0?0:Math.min(100,Math.round((pL.filter(l=>l.calls>0).length/pL.length)*100));const r=sc>=80?"low":sc>=60?"medium":"high";return(<div key={u.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid "+T.bdr+"12"}}>
+<span style={{fontSize:12,fontWeight:500,color:T.tx,width:130}}>{u.name}</span>
+<div style={{flex:1}}><Bar v={sc} max={100} color={sc>=80?T.grn:T.yel} h={4}/></div>
+<Bd text={r+" risk"} color={r==="low"?"grn":r==="medium"?"yel":"red"}/><span style={{fontFamily:MONO,fontWeight:700,color:sc>=80?T.grn:T.yel}}>{sc}%</span></div>)})}</Crd></div>}
 
 {/* TEAM STATS */}
 {vw==="team"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-{[{n:"Zoe (Setter)",r:"Setter",ratios:[{l:"Lead → Booked",v:ratioLeadToBooked+"%",c:T.acc},{l:"Booked → Show Up",v:ratioBookedToShowup+"%",c:T.cyn}]},
-  {n:"Arjun (Closer)",r:"Closer",ratios:[{l:"Show Up → Won",v:closerConvRate+"%",c:T.grn},{l:"Closer Pipeline",v:closerLeads.length,c:T.acc}]}].map(p=>{
+{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(u=>{const isSetter=u.subrole==="setter";const p={n:u.name,r:isSetter?"Setter":"Closer",ratios:isSetter?[{l:"Lead → Booked",v:ratioLeadToBooked+"%",c:T.acc},{l:"Booked → Show Up",v:ratioBookedToShowup+"%",c:T.cyn}]:[{l:"Show Up → Won",v:closerConvRate+"%",c:T.grn},{l:"Closer Pipeline",v:closerLeads.length,c:T.acc}]};
 const pL=leadsHydrated.filter(l=>p.r==="Setter"?l.setter===p.n:l.closer===p.n);const pW=pL.filter(l=>p.r==="Setter"?l.setterStage==="won":l.closerStage==="won");
-return(<Crd key={p.n} title={p.n}>
+return(<Crd key={u.id} title={p.n}>
 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
 {[{v:pL.length,l:"Total Leads",c:T.tx},{v:pW.length,l:"Won",c:T.grn},{v:pL.reduce((a,l)=>a+l.calls,0),l:"Calls",c:T.cyn},{v:fS(pW.reduce((a,l)=>a+l.ltv,0)),l:"LTV Generated",c:T.acc}].map(s=><div key={s.l} style={{background:T.s1,borderRadius:5,padding:8,textAlign:"center"}}><div style={{fontSize:14,fontWeight:700,color:s.c,fontFamily:MONO}}>{s.v}</div><div style={{fontSize:8,color:T.tx3}}>{s.l}</div></div>)}</div>
 <div style={{display:"flex",gap:6}}>{p.ratios.map(r=><div key={r.l} style={{flex:1,background:T.s2,borderRadius:5,padding:8,textAlign:"center"}}><div style={{fontSize:16,fontWeight:700,color:r.c,fontFamily:MONO}}>{r.v}</div><div style={{fontSize:8,color:T.tx3}}>{r.l}</div></div>)}</div>
@@ -1280,6 +1306,7 @@ return(<Crd key={p.n} title={p.n}>
 <Bd text={sel.heat} color={heatColor(sel.heat)}/>
 <span style={{display:"inline-flex",padding:"2px 8px",borderRadius:4,fontSize:9,fontWeight:700,background:stC(sel.setterStage,"setter")+"18",color:stC(sel.setterStage,"setter"),border:"1px solid "+stC(sel.setterStage,"setter")+"40",textTransform:"uppercase"}}>{stL(sel.setterStage,"setter")}</span>
 {sel.closerStage&&<span style={{display:"inline-flex",padding:"2px 8px",borderRadius:4,fontSize:9,fontWeight:700,background:stC(sel.closerStage,"closer")+"18",color:stC(sel.closerStage,"closer"),border:"1px solid "+stC(sel.closerStage,"closer")+"40",textTransform:"uppercase"}}>{stL(sel.closerStage,"closer")}</span>}
+{(sel.tags||[]).map(t=><Bd key={t} text={t} color="pur"/>)}
 </div>
 </div>
 <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
@@ -1403,15 +1430,85 @@ return(<div style={{display:"flex",flexDirection:"column",gap:0}}>
 })()}
 </div></Mod>}
 
-{showAdd&&<Mod title="Add New Lead" onClose={()=>setShowAdd(false)} wide><AddLeadForm onClose={()=>setShowAdd(false)} onAdd={l=>{setLeads(p=>[l,...p]);setShowAdd(false)}}/></Mod>}
+{showAdd&&<Mod title="Add New Lead" onClose={()=>setShowAdd(false)} wide><AddLeadForm allUsers={allUsers} onClose={()=>setShowAdd(false)} onAdd={l=>{setLeads(p=>[l,...p]);notifyNewLead({name:l.name,source:l.source,pipeline:l.pipeline||l.source,leadId:l.id});if((+l.value||0)>=10000)notifyHotLead({name:l.name,reason:"High value · "+fS(l.value),leadId:l.id,pipeline:l.pipeline||l.source});setShowAdd(false)}}/></Mod>}
 {showImport&&<Mod title="Import Leads from CSV" onClose={()=>setShowImport(false)} wide><ImportLeadsForm onClose={()=>setShowImport(false)} onImport={newLeads=>{setLeads(p=>[...newLeads,...p]);setShowImport(false)}}/></Mod>}
-{showLog&&<Mod title="Log a Call" onClose={()=>setShowLog(null)}><LogCallForm leads={leadsHydrated} info={showLog} onClose={()=>setShowLog(null)} onLog={(id,d,o,by)=>{addCall(id,d,o,by);setShowLog(null)}}/></Mod>}
+{showLog&&<Mod title="Log a Call" onClose={()=>setShowLog(null)}><LogCallForm leads={leadsHydrated} info={showLog} user={user} allUsers={allUsers} onClose={()=>setShowLog(null)} onLog={(id,d,o,by)=>{addCall(id,d,o,by);setShowLog(null)}}/></Mod>}
 {showPay&&<Mod title={"Record Payment — "+showPay.name} onClose={()=>setShowPay(null)}><AddPaymentForm lead={showPay} onClose={()=>setShowPay(null)} onAdd={(amt,what,type)=>{addPayment(showPay.id,amt,what,type);setShowPay(null);if(showPay.id===sel?.id)setSel(p=>({...p,payments:[...(p.payments||[]),{amount:+amt,date:new Date().toISOString(),what:what,type:type}]}))}}/></Mod>}
-{showAddPipeline&&<Mod title="Add New Pipeline" onClose={()=>setShowAddPipeline(false)}><AddPipelineForm onClose={()=>setShowAddPipeline(false)} onAdd={p=>{setPipelines(prev=>[...prev,p]);supabase.from('pipelines').insert({...p,sort_order:pipelines.length});setActivePipeline(p.id);setShowAddPipeline(false)}}/></Mod>}
-{showAddStage&&<Mod title={"Add Stage to "+(showAddStage==="setter"?"Setter":"Closer")+" Pipeline"} onClose={()=>setShowAddStage(null)}><AddStageForm kind={showAddStage} onClose={()=>setShowAddStage(null)} onAdd={s=>{const tbl=showAddStage==="setter"?'setter_stages':'closer_stages';const list=showAddStage==="setter"?setterStages:closerStages;if(showAddStage==="setter")setSetterStages(prev=>[...prev,s]);else setCloserStages(prev=>[...prev,s]);supabase.from(tbl).insert({id:s.id,label:s.l,color:s.c,sort_order:list.length});setShowAddStage(null)}}/></Mod>}
+{showAddPipeline&&<Mod title="Add New Pipeline" onClose={()=>setShowAddPipeline(false)}><AddPipelineForm onClose={()=>setShowAddPipeline(false)} onAdd={p=>{setPipelines(prev=>[...prev,p]);supabase.from('pipelines').insert({...p,sort_order:pipelines.length}).then(({error})=>{if(error){console.error('Pipeline insert failed',{p,error});alert('Could not save the new pipeline: '+(error.message||error.code||'unknown error'))}});setActivePipeline(p.id);setShowAddPipeline(false)}}/></Mod>}
+{showAddStage&&<Mod title={"Add Stage to "+(showAddStage==="setter"?"Setter":"Closer")+" Pipeline"} onClose={()=>setShowAddStage(null)}><AddStageForm kind={showAddStage} onClose={()=>setShowAddStage(null)} onAdd={s=>{const tbl=showAddStage==="setter"?'setter_stages':'closer_stages';const list=showAddStage==="setter"?setterStages:closerStages;if(showAddStage==="setter")setSetterStages(prev=>[...prev,s]);else setCloserStages(prev=>[...prev,s]);console.log('[addStage] INSERT into Supabase',{tbl,row:{id:s.id,label:s.l,color:s.c,sort_order:list.length}});supabase.from(tbl).insert({id:s.id,label:s.l,color:s.c,sort_order:list.length,pipeline_id:activePipeline}).then(({error})=>{if(error){console.error('[addStage] Supabase insert FAILED — stage will vanish on refresh',{tbl,s,error});{const m=(error.message||'')+(error.code?' ['+error.code+']':'');const hint=/pipeline_id|does not exist|42703/i.test(m)?'\n\nThe stages tables are missing the per-pipeline column. Run add-pipeline-id-to-stages.sql in Supabase.':/relation.*does not exist|42P01/i.test(m)?'\n\nThe stages table is missing. Run fix-crm-persistence.sql then add-pipeline-id-to-stages.sql.':'\n\nLikely RLS — check the policy on '+tbl+'.';alert('Could not save the new stage: '+(error.message||error.code||'unknown error')+hint)}}else console.log('[addStage] Supabase insert OK',{tbl,id:s.id})});setShowAddStage(null)}}/></Mod>}
 {showEditStage&&<Mod title={"Edit Stage — "+showEditStage.stage.l} onClose={()=>setShowEditStage(null)}><EditStageForm stage={showEditStage.stage} kind={showEditStage.kind} onClose={()=>setShowEditStage(null)} onSave={patch=>{editStage(showEditStage.kind,showEditStage.stage.id,patch);setShowEditStage(null)}} onDelete={()=>{const cnt=showEditStage.kind==="setter"?leadsHydrated.filter(l=>l.setterStage===showEditStage.stage.id).length:closerLeads.filter(l=>l.closerStage===showEditStage.stage.id).length;const msg=cnt>0?"Delete stage \""+showEditStage.stage.l+"\"? "+cnt+" lead"+(cnt>1?"s":"")+" will move to the first stage.":"Delete stage \""+showEditStage.stage.l+"\"?";if(confirm(msg)){deleteStage(showEditStage.kind,showEditStage.stage.id);setShowEditStage(null)}}}/></Mod>}
-{showEdit&&<Mod title={"Edit Lead — "+showEdit.name} onClose={()=>setShowEdit(null)} wide><EditLeadForm lead={showEdit} onClose={()=>setShowEdit(null)} onSave={patch=>{updateLead(showEdit.id,patch);setShowEdit(null)}} onDelete={()=>{if(confirm("Delete lead "+showEdit.name+"? This cannot be undone.")){setLeads(p=>p.filter(l=>l.id!==showEdit.id));supabase.from('leads').delete().eq('id',showEdit.id);}setShowEdit(null);setSel(null)}}/></Mod>}
+{showEdit&&<Mod title={"Edit Lead — "+showEdit.name} onClose={()=>setShowEdit(null)} wide><EditLeadForm lead={showEdit} allUsers={allUsers} onClose={()=>setShowEdit(null)} onSave={patch=>{updateLead(showEdit.id,patch);setShowEdit(null)}} onDelete={()=>{if(confirm("Delete lead "+showEdit.name+"? This cannot be undone.")){setLeads(p=>p.filter(l=>l.id!==showEdit.id));supabase.from('leads').delete().eq('id',showEdit.id);}setShowEdit(null);setSel(null)}}/></Mod>}
+{activeCall&&<CallModal call={activeCall} user={user} onClose={()=>setActiveCall(null)} onLog={(dur,outcome)=>{addCall(activeCall.lead.id,dur,outcome,user?.name||"Team");setActiveCall(null)}}/>}
 </div>)}
+
+/* CALL MODAL — phone screen with timer, end-call → duration+outcome → auto log */
+function CallModal({call,user,onClose,onLog}){
+const[phase,setPhase]=useState("ringing");/* ringing | wrap */
+const[elapsed,setElapsed]=useState(0);
+const[outcome,setOutcome]=useState("");
+const[durOverride,setDurOverride]=useState("");
+const[outResult,setOutResult]=useState("connected");/* connected | no_answer | voicemail | wrong_num */
+const lead=call.lead;
+const phone=lead.phone||"";
+useEffect(()=>{
+  if(phase!=="ringing")return;
+  const t=setInterval(()=>setElapsed(Math.floor((Date.now()-call.startedAt)/1000)),1000);
+  return()=>clearInterval(t);
+},[phase,call.startedAt]);
+const mm=String(Math.floor(elapsed/60)).padStart(2,"0");
+const ss=String(elapsed%60).padStart(2,"0");
+const endCall=()=>{
+  setDurOverride(String(Math.max(1,Math.ceil(elapsed/60))));
+  setPhase("wrap");
+};
+const submit=()=>{
+  const dur=parseInt(durOverride)||0;
+  const out=outResult==="connected"?(outcome||"Connected"):outResult==="no_answer"?"No answer":outResult==="voicemail"?"Left voicemail":"Wrong number";
+  onLog(dur,outcome?out+" — "+outcome:out);
+};
+const isMobile=typeof window!=="undefined"&&/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+return(
+<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1100,backdropFilter:"blur(6px)"}} onClick={onClose}>
+<div style={{background:T.s1,borderRadius:16,width:"92%",maxWidth:380,padding:0,border:"1px solid "+T.bdr,overflow:"hidden"}} onClick={e=>e.stopPropagation()}>
+{phase==="ringing"?<>
+<div style={{padding:"30px 24px 22px",textAlign:"center",background:"linear-gradient(180deg,"+T.s2+","+T.s1+")"}}>
+<div style={{width:84,height:84,borderRadius:99,background:"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 14px",fontSize:30,fontWeight:800,color:"#000",fontFamily:MONO}}>{lead.name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}</div>
+<div style={{fontSize:18,fontWeight:700,color:T.tx,marginBottom:4}}>{lead.name}</div>
+<div style={{fontSize:13,color:T.tx2,fontFamily:MONO,marginBottom:2}}>{phone||"No phone number"}</div>
+<div style={{fontSize:10,color:T.tx3}}>{lead.company}</div>
+<div style={{marginTop:18,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+<div style={{width:8,height:8,borderRadius:99,background:T.grn,animation:"pulse 1s infinite"}}/>
+<span style={{fontSize:11,color:T.grn,fontWeight:600,letterSpacing:.5}}>CALL IN PROGRESS</span>
+</div>
+<div style={{fontSize:34,fontWeight:700,color:T.tx,fontFamily:MONO,marginTop:12,letterSpacing:1}}>{mm}:{ss}</div>
+</div>
+<div style={{padding:"18px 24px 24px",display:"flex",flexDirection:"column",gap:10}}>
+{isMobile&&phone&&<a href={"tel:"+phone} style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:"12px",borderRadius:10,background:T.grnBg,color:T.grn,border:"1px solid "+T.grnD+"40",textDecoration:"none",fontWeight:600,fontSize:13,fontFamily:FONT}}><Ic t="phone" s={16} c={T.grn}/>Dial {phone}</a>}
+<button onClick={endCall} style={{padding:"14px",borderRadius:10,background:T.redBg,color:T.red,border:"1px solid "+T.redD+"40",cursor:"pointer",fontWeight:700,fontSize:13,fontFamily:FONT,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}><Ic t="x" s={16} c={T.red}/>End Call</button>
+<button onClick={onClose} style={{padding:"8px",borderRadius:8,background:"transparent",color:T.tx3,border:"none",cursor:"pointer",fontSize:11,fontFamily:FONT}}>Cancel without logging</button>
+</div>
+</>:<>
+<div style={{padding:"22px 24px 14px"}}>
+<div style={{fontSize:15,fontWeight:700,color:T.tx,marginBottom:4}}>Log call — {lead.name}</div>
+<div style={{fontSize:11,color:T.tx3}}>Auto-saved to {lead.name}'s call history</div>
+</div>
+<div style={{padding:"0 24px 22px",display:"flex",flexDirection:"column",gap:12}}>
+<div>
+<label style={{fontSize:10,color:T.tx3,fontWeight:500,textTransform:"uppercase",letterSpacing:.6,marginBottom:5,display:"block"}}>Outcome</label>
+<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:5}}>
+{[["connected","Connected",T.grn],["no_answer","No Answer",T.yel],["voicemail","Voicemail",T.blu],["wrong_num","Wrong #",T.red]].map(([k,l,c])=><button key={k} onClick={()=>setOutResult(k)} style={{padding:"8px 10px",borderRadius:6,border:"1px solid "+(outResult===k?c:T.bdr),background:outResult===k?c+"18":T.s2,color:outResult===k?c:T.tx2,fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:FONT}}>{l}</button>)}
+</div>
+</div>
+<Inp label="Duration (minutes)" value={durOverride} onChange={setDurOverride} type="number" mono/>
+<Inp label="Notes / Outcome details" value={outcome} onChange={setOutcome} ph="What was discussed? Next steps?" ta/>
+<div style={{display:"flex",gap:8,marginTop:4}}>
+<Btn full onClick={onClose}>Cancel</Btn>
+<Btn v="pri" full icon="chk" onClick={submit}>Log Call</Btn>
+</div>
+</div>
+</>}
+</div>
+</div>);}
 
 function ImportLeadsForm({onClose,onImport}){
 const[csv,setCsv]=useState("");
@@ -1465,6 +1562,7 @@ const handleImport=async()=>{
   }));
   const{error}=await supabase.from('leads').insert(dbLeads);
   if(error){setErr("DB error: "+error.message);return}
+  notifyNewLead(leads.length===1?{name:leads[0].name,pipeline,leadId:leads[0].id}:{count:leads.length,pipeline});
   onImport(leads);
 };
 return(<div style={{display:"flex",flexDirection:"column",gap:14}}>
@@ -1580,7 +1678,7 @@ return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Btn v="pri" icon="chk" onClick={()=>{if(!label.trim())return;onSave({l:label.trim(),c:color})}}>Save Changes</Btn>
 </div></div></div>)}
 
-function EditLeadForm({lead,onClose,onSave,onDelete}){
+function EditLeadForm({lead,onClose,onSave,onDelete,allUsers}){
 const[f,setF]=useState({
 name:lead.name||"",company:lead.company||"",email:lead.email||"",phone:lead.phone||"",
 source:lead.source||"",priority:lead.priority||"warm",value:lead.value||0,
@@ -1602,8 +1700,8 @@ return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Inp label="Product" value={f.product} onChange={v=>u("product",v)}/>
 <Inp label="City" value={f.city} onChange={v=>u("city",v)}/>
 <Inp label="Industry" value={f.industry} onChange={v=>u("industry",v)}/>
-<Sel label="Setter" value={f.setter} onChange={v=>u("setter",v)} opts={[{v:"",l:"Unassigned"},{v:"Zoe (Setter)",l:"Zoe (Setter)"}]}/>
-<Sel label="Closer" value={f.closer} onChange={v=>u("closer",v)} opts={[{v:"",l:"Unassigned"},{v:"Arjun (Closer)",l:"Arjun (Closer)"}]}/>
+<Sel label="Setter" value={f.setter} onChange={v=>u("setter",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="setter"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
+<Sel label="Closer" value={f.closer} onChange={v=>u("closer",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="closer"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
 </div>
 <Inp label="Notes" value={f.notes} onChange={v=>u("notes",v)} ta/>
 
@@ -1620,7 +1718,7 @@ return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Btn v="pri" icon="chk" onClick={()=>{onSave(f)}}>Save Changes</Btn>
 </div></div></div>)}
 
-function AddLeadForm({onClose,onAdd}){const[f,setF]=useState({name:"",company:"",email:"",phone:"",source:"Whop (Course Buyer)",priority:"warm",value:"",product:"VIP Course",city:"",industry:"",notes:"",closer:""});const u=(k,v)=>setF(p=>({...p,[k]:v}));
+function AddLeadForm({onClose,onAdd,allUsers}){const[f,setF]=useState({name:"",company:"",email:"",phone:"",source:"",priority:"warm",value:"",product:"VIP Course",city:"",industry:"",notes:"",setter:"",closer:""});const u=(k,v)=>setF(p=>({...p,[k]:v}));
 return(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
 <Inp label="Name" value={f.name} onChange={v=>u("name",v)} ph="Full name"/>
 <Inp label="Company" value={f.company} onChange={v=>u("company",v)} ph="Company"/>
@@ -1629,17 +1727,18 @@ return(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
 <Sel label="Source" value={f.source} onChange={v=>u("source",v)} opts={SOURCES.map(s=>({v:s,l:s}))}/>
 <Sel label="Priority" value={f.priority} onChange={v=>u("priority",v)} opts={[{v:"hot",l:"Hot"},{v:"warm",l:"Warm"},{v:"cold",l:"Cold"}]}/>
 <Inp label="Value" value={f.value} onChange={v=>u("value",v)} ph="2500000" type="number" mono/>
-<Sel label="Closer" value={f.closer} onChange={v=>u("closer",v)} opts={[{v:"",l:"Unassigned"},{v:"Arjun (Closer)",l:"Arjun (Closer)"}]}/>
+<Sel label="Setter" value={f.setter} onChange={v=>u("setter",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="setter"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
+<Sel label="Closer" value={f.closer} onChange={v=>u("closer",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="closer"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
 <div style={{gridColumn:"span 2"}}><Inp label="Notes" value={f.notes} onChange={v=>u("notes",v)} ph="Context..." ta/></div>
 <div style={{gridColumn:"span 2",display:"flex",justifyContent:"flex-end",gap:6}}><Btn onClick={onClose}>Cancel</Btn>
-<Btn v="pri" icon="plus" onClick={()=>{if(!f.name||!f.company)return;const now=new Date().toISOString();onAdd({id:uid(),name:f.name,company:f.company,email:f.email,phone:f.phone,source:f.source,setterStage:"new",closerStage:null,priority:f.priority,value:+f.value||0,setter:"Zoe (Setter)",closer:f.closer,product:f.product,city:f.city,industry:f.industry,notes:f.notes,createdAt:now,tokenPaidAt:null,firstPaidAt:null,calls:0,callLogs:[],followUps:[{date:TODAY,done:false,note:"Initial outreach"}],setterHistory:[{stage:"new",at:now,by:"Manual"}],closerHistory:[],payments:[]})}}>Add Lead</Btn></div></div>)}
+<Btn v="pri" icon="plus" onClick={()=>{if(!f.name||!f.company)return;const now=new Date().toISOString();onAdd({id:uid(),name:f.name,company:f.company,email:f.email,phone:f.phone,source:f.source,setterStage:"new",closerStage:null,priority:f.priority,value:+f.value||0,setter:f.setter,closer:f.closer,product:f.product,city:f.city,industry:f.industry,notes:f.notes,createdAt:now,tokenPaidAt:null,firstPaidAt:null,calls:0,callLogs:[],followUps:[{date:TODAY,done:false,note:"Initial outreach"}],setterHistory:[{stage:"new",at:now,by:"Manual"}],closerHistory:[],payments:[]})}}>Add Lead</Btn></div></div>)}
 
-function LogCallForm({leads,info,onClose,onLog}){const[lid,setLid]=useState(info.leadId||"");const[dur,setDur]=useState("");const[out,setOut]=useState("");const[by,setBy]=useState("Zoe");
+function LogCallForm({leads,info,onClose,onLog,allUsers,user}){const callerOpts=(allUsers||[]).filter(x=>x.subrole==="setter"||x.subrole==="closer"||x.role==="admin").map(x=>({v:x.name,l:x.name+(x.subrole?" ("+(x.subrole==="setter"?"Setter":"Closer")+")":"")}));const[lid,setLid]=useState(info.leadId||"");const[dur,setDur]=useState("");const[out,setOut]=useState("");const[by,setBy]=useState(user?.name||(callerOpts[0]?.v||""));
 return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
-<Sel label="Lead" value={lid} onChange={setLid} opts={[{v:"",l:"Select..."},...leads.map(l=>({v:l.id,l:l.name+" ("+l.company+")"}))]}/> 
+<Sel label="Lead" value={lid} onChange={setLid} opts={[{v:"",l:"Select..."},...leads.map(l=>({v:l.id,l:l.name+" ("+l.company+")"}))]}/>
 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
 <Inp label="Duration (min)" value={dur} onChange={setDur} ph="15" type="number" mono/>
-<Sel label="Caller" value={by} onChange={setBy} opts={[{v:"Zoe",l:"Zoe (Setter)"},{v:"Arjun",l:"Arjun (Closer)"}]}/></div>
+<Sel label="Caller" value={by} onChange={setBy} opts={callerOpts.length>0?callerOpts:[{v:"",l:"No team members"}]}/></div>
 <Inp label="Outcome" value={out} onChange={setOut} ph="What happened?" ta/>
 <div style={{display:"flex",justifyContent:"flex-end",gap:6}}><Btn onClick={onClose}>Cancel</Btn><Btn v="pri" icon="phone" onClick={()=>{if(lid&&dur)onLog(lid,dur,out,by)}}>Save</Btn></div></div>)}
 
@@ -1669,10 +1768,32 @@ const sourceCash=useMemo(()=>{
 
 const avgTicket=leadCash.length>0?Math.round(totCashFromLeads/leadCash.length):0;
 
+/* Real revenue by month — from lead payments, last 6 months */
+const monthlyRev=useMemo(()=>{
+  const now=new Date();
+  const months=[];
+  for(let i=5;i>=0;i--){
+    const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+    months.push({y:d.getFullYear(),m:d.getMonth(),label:d.toLocaleString("en-US",{month:"short"}),r:0});
+  }
+  (leads||[]).forEach(l=>(l.payments||[]).forEach(p=>{
+    if(!p.date)return;
+    let d;
+    if(typeof p.date==='string'&&/^\d{1,2}\/\d{1,2}\/\d{4}/.test(p.date)){
+      const[dd,mm,rest]=p.date.split('/');
+      d=new Date(parseInt(rest),parseInt(mm)-1,parseInt(dd));
+    }else d=new Date(p.date);
+    if(isNaN(d.getTime()))return;
+    const bucket=months.find(x=>x.y===d.getFullYear()&&x.m===d.getMonth());
+    if(bucket)bucket.r+=Number(p.amount)||0;
+  }));
+  return months;
+},[leads]);
+
 return(
 <div style={{display:"flex",flexDirection:"column",gap:16}}>
 <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10}}>
-<St label="Revenue" value={fS(FIN.revenue)} trend={12} icon="dollar" color={T.grn}/>
+<St label="Revenue" value={fS(totCashFromLeads)} sub="cash collected" icon="dollar" color={T.grn}/>
 <St label="Cash from Leads" value={fS(totCashFromLeads)} sub={leadCash.length+" paying"} icon="dollar" color={T.grn}/>
 <St label="Avg Ticket" value={fS(avgTicket)} icon="bar" color={T.acc}/>
 <St label="Invoiced" value={fS(totI)} icon="inv" color={T.blu}/>
@@ -1683,9 +1804,9 @@ return(
 <Btn v="pri" icon="plus" onClick={()=>setShowCreate(true)}>Create Invoice</Btn></div>
 
 {vw==="overview"&&<div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:12}}>
-<Crd title="Revenue vs Expenses"><div style={{display:"flex",alignItems:"flex-end",gap:7,height:170}}>{FIN.monthly.map((m,i)=>{const mx=Math.max(...FIN.monthly.map(d=>Math.max(d.r,d.e)));return(<div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
-<div style={{display:"flex",gap:2,alignItems:"flex-end",width:"100%",justifyContent:"center",height:145}}><div style={{width:"38%",background:"linear-gradient(to top,"+T.grnD+","+T.grn+")",borderRadius:"3px 3px 0 0",height:(m.r/mx)*100+"%"}}/><div style={{width:"38%",background:"linear-gradient(to top,"+T.redD+","+T.red+"70)",borderRadius:"3px 3px 0 0",height:(m.e/mx)*100+"%"}}/></div><span style={{fontSize:9,color:T.tx3}}>{m.m}</span></div>)})}</div></Crd>
-<Crd title="Cash Flow">{[{l:"Receivable",v:fS(8.9e6),c:T.yel},{l:"Payable",v:fS(4.5e6),c:T.red},{l:"Net",v:"+"+fS(4.4e6),c:T.grn},{l:"Margin",v:pc(FIN.profit,FIN.revenue)+"%",c:T.acc}].map(i=><div key={i.l} style={{background:T.s1,borderRadius:5,padding:10,marginBottom:6}}><div style={{fontSize:9,color:T.tx3}}>{i.l}</div><div style={{fontSize:16,fontWeight:700,color:i.c,fontFamily:MONO}}>{i.v}</div></div>)}</Crd></div>}
+<Crd title="Revenue by Month (Last 6)"><div style={{display:"flex",alignItems:"flex-end",gap:7,height:170}}>{(()=>{const mx=Math.max(...monthlyRev.map(d=>d.r),1);return monthlyRev.map((m,i)=>(<div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+<div style={{display:"flex",gap:2,alignItems:"flex-end",width:"100%",justifyContent:"center",height:145}}><div style={{width:"60%",background:"linear-gradient(to top,"+T.grnD+","+T.grn+")",borderRadius:"3px 3px 0 0",height:(m.r/mx)*100+"%"}} title={fS(m.r)}/></div><span style={{fontSize:9,color:T.tx3}}>{m.label}</span><span style={{fontSize:9,fontFamily:MONO,color:T.tx2}}>{fS(m.r)}</span></div>))})()}</div></Crd>
+<Crd title="Cash Flow">{[{l:"Invoiced",v:fS(totI),c:T.blu},{l:"Collected",v:fS(totP),c:T.grn},{l:"Outstanding",v:fS(totI-totP),c:T.red},{l:"From Leads",v:fS(totCashFromLeads),c:T.acc}].map(i=><div key={i.l} style={{background:T.s1,borderRadius:5,padding:10,marginBottom:6}}><div style={{fontSize:9,color:T.tx3}}>{i.l}</div><div style={{fontSize:16,fontWeight:700,color:i.c,fontFamily:MONO}}>{i.v}</div></div>)}</Crd></div>}
 
 {/* CASH COLLECTED PER LEAD */}
 {vw==="cash"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -1700,7 +1821,7 @@ return(
 
 <Crd title="Cash Collected — Per Lead Detail" action={<span style={{fontSize:10,color:T.tx3,fontFamily:MONO}}>Total: {fS(totCashFromLeads)}</span>}>
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Lead","Company","Source","Deal Value","Cash Collected","# Payments","Last Payment","What"].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Lead","Company","Source","Deal Value","Cash Collected","# Payments","Last Payment","What"].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{leadCash.map(l=>{const lastP=l.payments[l.payments.length-1];return(<tr key={l.id} style={{borderBottom:"1px solid "+T.bdr+"10"}}>
 <td style={{padding:8,fontWeight:500,color:T.tx}}>{l.name}</td>
 <td style={{padding:8,color:T.tx2}}>{l.company}</td>
@@ -1747,7 +1868,7 @@ return(
 
 <Crd title="Bank Transaction Feed" action={<span style={{fontSize:10,color:T.tx3}}>Auto-syncs every 5 minutes</span>}>
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Date","From","Amount","Method","Reference","Linked To","Status",""].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Date","From","Amount","Method","Reference","Linked To","Status",""].map(h=><th key={h} style={{textAlign:"left",padding:"7px 8px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{bankPayments?.map(b=>{const linkedLead=leads?.find(l=>l.id===b.linkedLeadId);const linkedInv=invoices.find(i=>i.id===b.linkedInvoiceId);return(<tr key={b.id} style={{borderBottom:"1px solid "+T.bdr+"10"}}>
 <td style={{padding:8,fontFamily:MONO,color:T.tx2,fontSize:10}}>{fmtDT(b.receivedAt)}</td>
 <td style={{padding:8,color:T.tx,fontWeight:500}}>{b.from}</td>
@@ -1773,7 +1894,7 @@ return(
 {showBankSetup&&<Mod title="Bank Webhook Setup" onClose={()=>setShowBankSetup(false)}><BankSetupForm onClose={()=>setShowBankSetup(false)}/></Mod>}
 
 {vw==="inv"&&<Crd title="Invoices"><div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["#","Client","Amount","Paid","Balance","Status","Type","Due",""].map(h=><th key={h} style={{textAlign:"left",padding:7,color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["#","Client","Amount","Paid","Balance","Status","Type","Due",""].map(h=><th key={h} style={{textAlign:"left",padding:7,color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{invoices.map(inv=>{const bal=inv.amount-inv.paid;const od=inv.due<TODAY&&inv.status!=="paid";return(<tr key={inv.id} style={{borderBottom:"1px solid "+T.bdr+"10"}}>
 <td style={{padding:7,fontFamily:MONO,color:T.acc,fontSize:9}}>{inv.id}</td><td style={{padding:7,color:T.tx}}>{inv.client}</td>
 <td style={{padding:7,fontFamily:MONO,fontWeight:600}}>{fS(inv.amount)}</td><td style={{padding:7,fontFamily:MONO,color:T.grn}}>{fS(inv.paid)}</td>
@@ -1784,12 +1905,11 @@ return(
 <td style={{padding:7}}><div style={{display:"flex",gap:3}}><Btn sm icon="eye" onClick={()=>setShowInvPrev(inv)}>View</Btn>{inv.status!=="paid"&&<Btn sm icon="dollar" onClick={()=>setShowPay(inv)}>Pay</Btn>}{od&&<Btn sm v="dan" icon="send">Remind</Btn>}</div></td>
 </tr>)})}</tbody></table></div></Crd>}
 
-{vw==="rec"&&<Crd title="Recurring Clients (Bank Transfer)">{FIN.rec.map(c=><div key={c.name} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid "+T.bdr+"10"}}>
-<Av name={c.name} sz={32} color={"linear-gradient(135deg,"+T.pur+",#c084fc)"}/><div style={{flex:1}}><div style={{fontSize:12,fontWeight:600,color:T.tx}}>{c.name}</div><div style={{fontSize:9,color:T.tx3}}>Bank transfer | Monthly</div></div>
-<div style={{fontSize:15,fontWeight:700,color:T.acc,fontFamily:MONO}}>{fS(c.mo)}/mo</div></div>)}
-<div style={{marginTop:10,padding:8,background:T.s1,borderRadius:5,fontSize:10,color:T.tx3,display:"flex",gap:5}}><Ic t="zap" s={12} c={T.grn}/>Auto-invoiced 1st of month | Overdue reminders Day 1,7,14,30</div></Crd>}
+{vw==="rec"&&<Crd title="Recurring Clients">{(()=>{const rec=invoices.filter(i=>i.recurring);if(rec.length===0)return<div style={{color:T.tx3,fontSize:11,padding:"16px 0",textAlign:"center"}}>No recurring invoices yet.</div>;return rec.map(c=><div key={c.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid "+T.bdr+"10"}}>
+<Av name={c.client} sz={32} color={"linear-gradient(135deg,"+T.pur+",#c084fc)"}/><div style={{flex:1}}><div style={{fontSize:12,fontWeight:600,color:T.tx}}>{c.client}</div><div style={{fontSize:9,color:T.tx3}}>Invoice {c.id} · {c.status}</div></div>
+<div style={{fontSize:15,fontWeight:700,color:T.acc,fontFamily:MONO}}>{fS(c.amount)}</div></div>)})()}</Crd>}
 
-{vw==="exp"&&<Crd title="Expenses">{FIN.cats.map(c=><div key={c.n} style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}><span style={{width:80,fontSize:11,color:T.tx2}}>{c.n}</span><div style={{flex:1}}><Bar v={c.p} max={60} color={T.acc} h={12}/></div><span style={{fontFamily:MONO,fontSize:11,fontWeight:600,color:T.tx,width:60,textAlign:"right"}}>{fS(c.a)}</span><span style={{fontFamily:MONO,fontSize:9,color:T.tx3,width:32,textAlign:"right"}}>{c.p}%</span></div>)}</Crd>}
+{vw==="exp"&&<Crd title="Expenses"><div style={{color:T.tx3,fontSize:11,padding:"16px 0",textAlign:"center"}}>Expense tracking not yet wired up. Connect your bank feed to auto-categorize outflows.</div></Crd>}
 
 {showPay&&<Mod title={"Pay "+showPay.id} onClose={()=>setShowPay(null)}><div style={{display:"flex",flexDirection:"column",gap:12}}>
 <div style={{background:T.s2,borderRadius:6,padding:12}}>{[["Total",fmt(showPay.amount),T.tx],["Paid",fmt(showPay.paid),T.grn],["Due",fmt(showPay.amount-showPay.paid),T.red]].map(r=><div key={r[0]} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",fontSize:11}}><span style={{color:T.tx3}}>{r[0]}</span><span style={{fontFamily:MONO,color:r[2]}}>{r[1]}</span></div>)}</div>
@@ -1809,7 +1929,7 @@ return(
 {/* Header */}
 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",borderBottom:"3px solid "+T.acc,paddingBottom:16,marginBottom:20}}>
 <div style={{display:"flex",alignItems:"center",gap:12}}>
-<div style={{width:54,height:54,borderRadius:10,background:"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:20,fontWeight:800,color:"#000",fontFamily:MONO}}>HT</span></div>
+<img src="/logo.png" alt="HTSyndicate" style={{height:54,objectFit:"contain",display:"block"}}/>
 <div><div style={{fontSize:22,fontWeight:800,color:"#1a1a1a",letterSpacing:-.5}}>HTSyndicate</div><div style={{fontSize:10,color:"#666"}}>Premium Sales & Consulting Services</div></div></div>
 <div style={{textAlign:"right"}}><div style={{fontSize:24,fontWeight:800,color:T.acc,letterSpacing:-1}}>INVOICE</div><div style={{fontSize:11,color:"#666",fontFamily:MONO}}>{inv.id}</div></div>
 </div>
@@ -1985,15 +2105,15 @@ return(
 /* ═══ OVERVIEW (Admin) ═══ */
 function OverP({leads,invoices,tasks,autos,punch}){const won=leads.filter(l=>l.stage==="won"),act=leads.filter(l=>!["won","lost"].includes(l.stage));
 const odT=tasks.filter(t=>t.due<TODAY&&t.status!=="done"),odI=invoices.filter(i=>i.due<TODAY&&i.status!=="paid");
+const revenue=leads.reduce((a,l)=>a+(l.payments||[]).reduce((b,p)=>b+(Number(p.amount)||0),0),0);
 return(
 <div style={{display:"flex",flexDirection:"column",gap:16}}>
 <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10}}>
-<St label="Revenue" value={fS(FIN.revenue)} trend={12} icon="dollar" color={T.grn}/>
+<St label="Revenue" value={fS(revenue)} sub="cash collected" icon="dollar" color={T.grn}/>
 <St label="Pipeline" value={fS(act.reduce((a,l)=>a+l.value,0))} sub={act.length+" leads"} icon="tgt" color={T.acc}/>
 <St label="Won" value={fS(won.reduce((a,l)=>a+l.value,0))} icon="chk" color={T.grn}/>
 <St label="Tasks" value={tasks.filter(t=>t.status!=="done").length} sub={odT.length+" overdue"} icon="task" color={T.yel}/>
-<St label="Outstanding" value={fS(invoices.reduce((a,i)=>a+(i.amount-i.paid),0))} icon="alert" color={T.red}/>
-<St label="Automations" value={autos.filter(a=>a.status==="active").length} icon="zap" color={T.cyn}/></div>
+<St label="Outstanding" value={fS(invoices.reduce((a,i)=>a+(i.amount-i.paid),0))} icon="alert" color={T.red}/></div>
 {(odT.length>0||odI.length>0)&&<Crd title="Action Required" style={{borderColor:T.redD+"35"}}>
 {odI.map(i=><div key={i.id} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 8px",borderRadius:5,background:T.redBg,marginBottom:4,fontSize:10}}><Ic t="alert" s={12} c={T.red}/><span style={{color:T.red,fontWeight:500}}>{i.client} — {i.id} overdue {dBtw(i.due,TODAY)}d</span></div>)}
 {odT.map(t=><div key={t.id} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 8px",borderRadius:5,background:T.yelBg,marginBottom:4,fontSize:10}}><Ic t="clock" s={12} c={T.yel}/><span style={{color:T.yel,fontWeight:500}}>"{t.title}" — {t.assignee}</span></div>)}</Crd>}
@@ -2007,20 +2127,33 @@ return(
 </div>)}
 
 /* ═══ REVENUE DASHBOARD (Admin) ═══ */
-function RevenueP({leads}){
+function RevenueP({leads,pipelines}){
 const[goal,setGoal]=useState(()=>parseInt(localStorage.getItem('htRevGoal')||'1000000'));
 const[editGoal,setEditGoal]=useState(false);
 const[goalInput,setGoalInput]=useState(goal);
+const[expandedPipe,setExpandedPipe]=useState(null);
+const[expandedMonth,setExpandedMonth]=useState(null);
 const now=new Date();
 const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
 const weekStart=new Date(today);weekStart.setDate(today.getDate()-today.getDay());
 const monthStart=new Date(now.getFullYear(),now.getMonth(),1);
-const getRev=(ls,from)=>ls.reduce((a,l)=>{return a+(l.payments||[]).filter(p=>new Date(p.date)>=from).reduce((b,p)=>b+p.amount,0)},0);
-const getCash=l=>(l.payments||[]).reduce((a,p)=>a+p.amount,0);
+const parsePmtDate=s=>{
+  if(!s)return null;
+  if(typeof s==='string'&&/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)){
+    const[d,m,rest]=s.split('/');
+    return new Date(parseInt(rest),parseInt(m)-1,parseInt(d));
+  }
+  const d=new Date(s);
+  return isNaN(d.getTime())?null:d;
+};
+const pmtAmt=p=>Number(p.amount)||0;
+const getRev=(ls,from)=>ls.reduce((a,l)=>a+(l.payments||[]).filter(p=>{const d=parsePmtDate(p.date);return d&&d>=from;}).reduce((b,p)=>b+pmtAmt(p),0),0);
+const getCash=l=>(l.payments||[]).reduce((a,p)=>a+pmtAmt(p),0);
 const totalCash=leads.reduce((a,l)=>a+getCash(l),0);
 const todayRev=getRev(leads,today);
 const weekRev=getRev(leads,weekStart);
 const monthRev=getRev(leads,monthStart);
+console.log('[RevenueP]',{leads:leads.length,withPayments:leads.filter(l=>(l.payments||[]).length>0).length,totalCash,todayRev,weekRev,monthRev,samplePayments:leads.filter(l=>(l.payments||[]).length>0).slice(0,3).map(l=>({name:l.name,payments:l.payments}))});
 const setterRevs={};leads.forEach(l=>{const s=l.setter;if(!s||s==="Unassigned")return;setterRevs[s]=(setterRevs[s]||0)+getCash(l);});
 const closerRevs={};leads.forEach(l=>{const c=l.closer;if(!c||c==="Unassigned")return;closerRevs[c]=(closerRevs[c]||0)+getCash(l);});
 const topSetters=Object.entries(setterRevs).sort((a,b)=>b[1]-a[1]).slice(0,5);
@@ -2028,6 +2161,29 @@ const topClosers=Object.entries(closerRevs).sort((a,b)=>b[1]-a[1]).slice(0,5);
 const srcRevs={};leads.forEach(l=>{const s=l.source||"Unknown";srcRevs[s]=(srcRevs[s]||0)+getCash(l);});
 const srcList=Object.entries(srcRevs).sort((a,b)=>b[1]-a[1]).filter(([,v])=>v>0);
 const maxSrc=srcList[0]?.[1]||1;
+
+/* Revenue by Pipeline — sum of payments for leads matching each pipeline (excluding "all") */
+const pipeRevs=(pipelines||[]).filter(p=>p.id!=="all").map(p=>{
+  const matched=leads.filter(l=>(l.pipeline||"").toLowerCase()===p.id.toLowerCase()||(p.sources||[]).includes(l.source));
+  const total=matched.reduce((a,l)=>a+getCash(l),0);
+  const bySrc={};matched.forEach(l=>{const s=l.source||"Unknown";bySrc[s]=(bySrc[s]||0)+getCash(l);});
+  return{id:p.id,name:p.name,color:p.color,total,sources:Object.entries(bySrc).sort((a,b)=>b[1]-a[1]).filter(([,v])=>v>0),count:matched.length};
+}).sort((a,b)=>b.total-a.total);
+const maxPipeRev=pipeRevs[0]?.total||1;
+
+/* Month-by-month breakdown — every payment grouped by calendar month, most recent first.
+   Each month carries its individual payments (lead name, amount, type, date) for the
+   expandable detail rows. */
+const monthMap={};
+leads.forEach(l=>(l.payments||[]).forEach(p=>{
+  const d=parsePmtDate(p.date);if(!d)return;
+  const key=d.getFullYear()+"-"+String(d.getMonth()).padStart(2,"0");
+  if(!monthMap[key])monthMap[key]={key,y:d.getFullYear(),m:d.getMonth(),label:d.toLocaleString("en-US",{month:"long",year:"numeric"}),total:0,payments:[]};
+  monthMap[key].total+=pmtAmt(p);
+  monthMap[key].payments.push({lead:l.name,amount:pmtAmt(p),type:p.type||"—",what:p.what||"Payment",date:d,sort:d.getTime()});
+}));
+const monthlyBreakdown=Object.values(monthMap).sort((a,b)=>(b.y-a.y)||(b.m-a.m)).map(mo=>({...mo,payments:mo.payments.sort((a,b)=>b.sort-a.sort)}));
+
 return(
 <div style={{display:"flex",flexDirection:"column",gap:14}}>
 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
@@ -2087,6 +2243,60 @@ return(
 </div>)}
 </Crd>
 </div>
+<Crd title="Revenue by Pipeline" action={<span style={{fontSize:10,color:T.tx3}}>Click a pipeline to see source breakdown</span>}>
+{pipeRevs.length===0?<div style={{color:T.tx3,fontSize:11,padding:"12px 0",textAlign:"center"}}>No pipelines configured</div>:pipeRevs.map(p=>{const open=expandedPipe===p.id;return(
+<div key={p.id} style={{borderBottom:"1px solid "+T.bdr+"20",padding:"8px 0"}}>
+<div onClick={()=>setExpandedPipe(open?null:p.id)} style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"4px 0"}}>
+<div style={{width:8,height:8,borderRadius:99,background:p.color,flexShrink:0}}/>
+<span style={{flex:1,fontSize:12,color:T.tx,fontWeight:600}}>{p.name}</span>
+<span style={{fontSize:10,color:T.tx3,fontFamily:MONO}}>{p.count} leads</span>
+<span style={{fontFamily:MONO,fontWeight:700,color:T.grn,fontSize:13,minWidth:80,textAlign:"right"}}>{fS(p.total)}</span>
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={T.tx3} strokeWidth="2" style={{transform:open?"rotate(180deg)":"rotate(0)",transition:"transform .15s"}}><polyline points="6 9 12 15 18 9"/></svg>
+</div>
+<div style={{marginTop:5}}><Bar v={p.total} max={maxPipeRev} color={p.color} h={5}/></div>
+{open&&<div style={{marginTop:10,paddingLeft:18,borderLeft:"2px solid "+p.color+"40"}}>
+{p.sources.length===0?<div style={{fontSize:11,color:T.tx3,padding:"6px 0"}}>No paying leads in this pipeline yet.</div>:p.sources.map(([src,v])=><div key={src} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 0",fontSize:11}}>
+<span style={{flex:1,color:T.tx2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{src}</span>
+<div style={{width:120}}><Bar v={v} max={p.total||1} color={p.color} h={4}/></div>
+<span style={{fontFamily:MONO,fontWeight:600,color:T.tx,width:80,textAlign:"right"}}>{fS(v)}</span>
+<span style={{fontFamily:MONO,fontSize:9,color:T.tx3,width:40,textAlign:"right"}}>{pc(v,p.total)}%</span>
+</div>)}
+</div>}
+</div>);})}
+</Crd>
+<Crd title="Monthly Revenue" action={<span style={{fontSize:10,color:T.tx3}}>Click a month to see its payments</span>}>
+{monthlyBreakdown.length===0?<div style={{color:T.tx3,fontSize:11,padding:"12px 0",textAlign:"center"}}>No payments recorded yet</div>:monthlyBreakdown.map(mo=>{const open=expandedMonth===mo.key;return(
+<div key={mo.key} style={{borderBottom:"1px solid "+T.bdr+"20",padding:"8px 0"}}>
+<div onClick={()=>setExpandedMonth(open?null:mo.key)} style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",padding:"4px 0"}}>
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={T.tx3} strokeWidth="2" style={{transform:open?"rotate(180deg)":"rotate(0)",transition:"transform .15s",flexShrink:0}}><polyline points="6 9 12 15 18 9"/></svg>
+<span style={{flex:1,fontSize:12,color:T.tx,fontWeight:600}}>{mo.label}</span>
+<span style={{fontSize:10,color:T.tx3,fontFamily:MONO}}>{mo.payments.length} payment{mo.payments.length!==1?"s":""}</span>
+<span style={{fontFamily:MONO,fontWeight:700,color:T.grn,fontSize:13,minWidth:90,textAlign:"right"}}>{fS(mo.total)}</span>
+</div>
+{open&&<div style={{marginTop:8,paddingLeft:22}}>
+<div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+<thead><tr style={{color:T.tx3,textAlign:"left"}}>
+<th style={{padding:"4px 8px",fontWeight:500}}>Lead</th>
+<th style={{padding:"4px 8px",fontWeight:500}}>Type</th>
+<th style={{padding:"4px 8px",fontWeight:500}}>Date</th>
+<th style={{padding:"4px 8px",fontWeight:500,textAlign:"right"}}>Amount</th>
+</tr></thead>
+<tbody>
+{mo.payments.map((p,i)=><tr key={i} style={{borderTop:"1px solid "+T.bdr+"20"}}>
+<td style={{padding:"6px 8px",color:T.tx,fontWeight:500}}>{p.lead}<div style={{fontSize:9,color:T.tx3,fontWeight:400}}>{p.what}</div></td>
+<td style={{padding:"6px 8px"}}><Bd text={p.type} color={p.type==="token"?"yel":p.type==="final"?"grn":"acc"}/></td>
+<td style={{padding:"6px 8px",color:T.tx3,fontFamily:MONO,fontSize:10}}>{p.date.toLocaleDateString("en-US",{day:"numeric",month:"short",year:"numeric"})}</td>
+<td style={{padding:"6px 8px",textAlign:"right",fontFamily:MONO,fontWeight:600,color:T.grn}}>{fS(p.amount)}</td>
+</tr>)}
+</tbody>
+<tfoot><tr style={{borderTop:"1px solid "+T.bdr}}>
+<td colSpan={3} style={{padding:"6px 8px",color:T.tx2,fontWeight:600,fontSize:10,textTransform:"uppercase",letterSpacing:.5}}>Month Total</td>
+<td style={{padding:"6px 8px",textAlign:"right",fontFamily:MONO,fontWeight:700,color:T.grn}}>{fS(mo.total)}</td>
+</tr></tfoot>
+</table></div>
+</div>}
+</div>);})}
+</Crd>
 </div>
 )}
 
@@ -2147,6 +2357,7 @@ const importNow=async()=>{
     if(imported.length>0){
       setLeads(p=>[...imported,...p]);
       imported.forEach(l=>supabase.from('leads').insert(leadToDb(l)));
+      notifyNewLead(imported.length===1?{name:imported[0].name,source:imported[0].source,pipeline:imported[0].pipeline||imported[0].source,leadId:imported[0].id}:{count:imported.length,source:"Google Sheets"});
     }
     localStorage.setItem('htLastImportRow',String(totalRows+1));
     const ts=new Date().toISOString();
@@ -2270,13 +2481,13 @@ return(
 /* ═══ TEAM PAGE (Admin) ═══ */
 function TeamP({allUsers,setAllUsers}){
 const[search,setSearch]=useState("");
-const filtered=allUsers.filter(u=>u.name.toLowerCase().includes(search.toLowerCase())||u.email.toLowerCase().includes(search.toLowerCase()));
+const q=(search||"").toLowerCase();const filtered=allUsers.filter(u=>(u.name||"").toLowerCase().includes(q)||(u.email||"").toLowerCase().includes(q)||(u.role||"").toLowerCase().includes(q));
 const changeRole=(id,patch)=>{setAllUsers(p=>p.map(u=>u.id===id?{...u,...patch}:u));supabase.from('profiles').update(patch).eq('id',id);};
 const removeUser=(id)=>{
   const u=allUsers.find(x=>x.id===id);
   if(!u)return;
   if(u.role==="admin"&&allUsers.filter(x=>x.role==="admin").length<=1){alert("Cannot remove the last admin.");return}
-  if(confirm("Remove "+u.name+"? They will no longer be able to sign in.")){setAllUsers(p=>p.filter(x=>x.id!==id));supabase.from('profiles').delete().eq('id',id);}
+  if(confirm("Remove "+(u.name||u.email||"this user")+"? They will no longer be able to sign in.")){setAllUsers(p=>p.filter(x=>x.id!==id));supabase.from('profiles').delete().eq('id',id);}
 };
 return(
 <div style={{display:"flex",flexDirection:"column",gap:14}}>
@@ -2286,10 +2497,10 @@ return(
 </div>
 <Crd title="Team Members">
 <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
-<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Name","Email","Role","Joined","Sign-in",""].map(h=><th key={h} style={{textAlign:"left",padding:"8px 10px",color:T.tx3,fontWeight:500,fontSize:9,textTransform:"uppercase"}}>{h}</th>)}</tr></thead>
+<thead><tr style={{borderBottom:"1px solid "+T.bdr}}>{["Name","Email","Role","Joined","Sign-in",""].map(h=><th key={h} style={{textAlign:"left",padding:"8px 10px",color:T.tx3,fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:.5}}>{h}</th>)}</tr></thead>
 <tbody>{filtered.map(u=><tr key={u.id} style={{borderBottom:"1px solid "+T.bdr+"15"}}>
-<td style={{padding:10}}><div style={{display:"flex",alignItems:"center",gap:8}}><Av name={u.name} sz={28}/><span style={{fontWeight:500,color:T.tx}}>{u.name}</span></div></td>
-<td style={{padding:10,color:T.tx2,fontFamily:MONO,fontSize:10}}>{u.email}</td>
+<td style={{padding:10}}><div style={{display:"flex",alignItems:"center",gap:8}}><Av name={u.name||u.email||"?"} sz={28}/><span style={{fontWeight:500,color:T.tx}}>{u.name||"—"}</span></div></td>
+<td style={{padding:10,color:T.tx2,fontFamily:MONO,fontSize:10}}>{u.email||"—"}</td>
 <td style={{padding:10}}>
 <select value={u.role+(u.subrole?":"+u.subrole:"")} onChange={e=>{const[r,sr]=e.target.value.split(":");changeRole(u.id,{role:r,subrole:sr||r,dept:r==="admin"?"all":r==="sales"?"sales":r==="finance"?"finance":"tech"})}} style={{padding:"5px 8px",borderRadius:5,border:"1px solid "+T.bdr,background:T.inp,color:T.tx,fontSize:11,fontFamily:FONT,outline:"none"}}>
 <option value="admin:admin">Admin</option>
@@ -2308,7 +2519,7 @@ return(
 </Crd>
 <div style={{padding:12,background:T.s2,borderRadius:8,fontSize:11,color:T.tx2,lineHeight:1.6,border:"1px solid "+T.bdr}}>
 <div style={{fontSize:11,fontWeight:600,color:T.tx,marginBottom:4}}>How signups work</div>
-Anyone with the dashboard URL can sign up. When they pick a role, they get matching access automatically. You'll see a notification in your bell every time someone joins. From this page you can change roles or remove members.
+Anyone with the dashboard URL can sign up (email or Google) and joins as a <b style={{color:T.tx2}}>Setter</b> by default — nobody can self-select a higher role. You'll get a bell notification when someone joins. Promote them (Closer / Admin) or remove them from this page.
 </div>
 </div>
 )}
@@ -2324,13 +2535,15 @@ const[err,setErr]=useState("");
 const handleComplete=async()=>{
   setErr("");setLoading(true);
   if(!name.trim()){setErr("Please enter your name");setLoading(false);return}
-  const dept=role==="admin"?"all":role==="sales"?"sales":role==="finance"?"finance":"tech";
-  const finalSubrole=role==="sales"?subrole:role==="admin"?"admin":role;
   const provider=authUser.app_metadata?.provider||authUser.identities?.[0]?.provider||'password';
-  const displayName=role==="sales"?(name.trim()+" ("+(subrole==="setter"?"Setter":"Closer")+")"):(name.trim()+(role==="admin"?" (Admin)":role==="finance"?" (Finance)":" (Tech)"));
-  console.log("[PROFILE] Upserting profile for",authUser.email,"id:",authUser.id);
+  console.log("[PROFILE] Saving name for",authUser.email,"id:",authUser.id);
+  /* Role is intentionally NOT written here. The 0c signup trigger already
+     created this profile as least-privilege setter; we only persist name/email
+     so this page can never override the trigger's role. Admins promote via Team.
+     On INSERT (if the trigger somehow didn't run) role/subrole fall back to the
+     table defaults (sales/setter), which are also least-privilege. */
   const{error}=await supabase.from('profiles').upsert(
-    {id:authUser.id,name:displayName,email:authUser.email,role,subrole:finalSubrole,dept,provider},
+    {id:authUser.id,name:name.trim(),email:authUser.email,provider},
     {onConflict:'id'}
   );
   if(error){
@@ -2348,7 +2561,7 @@ return(
 
 {/* Header */}
 <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}>
-<div style={{width:44,height:44,borderRadius:10,background:"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:16,fontWeight:800,color:"#000",fontFamily:MONO}}>HT</span></div>
+<img src="/logo.png" alt="HTSyndicate" style={{height:44,objectFit:"contain",display:"block"}}/>
 <div><div style={{fontSize:18,fontWeight:700,color:T.tx}}>One last step</div><div style={{fontSize:11,color:T.tx3}}>Tell us about your role at HTSyndicate</div></div>
 </div>
 
@@ -2364,25 +2577,12 @@ return(
 
 {/* Form */}
 <div style={{display:"flex",flexDirection:"column",gap:12}}>
-<Inp label="Your Name" value={name} onChange={setName} ph="Full name (e.g. Arjun)"/>
-<Sel label="Role in Company" value={role} onChange={setRole} opts={[
-  {v:"admin",l:"Admin / Boss (full access)"},
-  {v:"sales",l:"Sales (setter or closer)"},
-  {v:"finance",l:"Finance / Accounting"},
-  {v:"tech",l:"Tech / Automations"}
-]}/>
-{role==="sales"&&<Sel label="Sales Position" value={subrole} onChange={setSubrole} opts={[
-  {v:"setter",l:"Setter (qualifies leads, books calls)"},
-  {v:"closer",l:"Closer (closes deals)"}
-]}/>}
-
+<Inp label="Your Name" value={name} onChange={setName} ph="Full name"/>
+{/* No role picker — new Google users join as a least-privilege Setter.
+    Admins promote from the Team page. Matches the 0c trigger. */}
 <div style={{padding:10,background:T.s1,borderRadius:6,fontSize:10,color:T.tx3,lineHeight:1.6}}>
-<div style={{fontWeight:600,color:T.tx2,marginBottom:2}}>Your access:</div>
-{role==="admin"&&"Full access — sales, finance, automations, tasks, attendance, team"}
-{role==="sales"&&subrole==="setter"&&"Setter pipeline, lead sheet, calls, tasks, leaves"}
-{role==="sales"&&subrole==="closer"&&"Closer pipeline, lead sheet, calls, tasks, leaves"}
-{role==="finance"&&"Finance section (invoices, payments, bank), tasks, leaves"}
-{role==="tech"&&"Automations dashboard, tasks, leaves"}
+<div style={{fontWeight:600,color:T.tx2,marginBottom:2}}>Your access</div>
+You'll join as a <b style={{color:T.tx2}}>Setter</b> — pipeline, lead sheet, calls, tasks, and leaves. An admin can promote you from the Team page.
 </div>
 
 {err&&<div style={{fontSize:11,color:T.red,padding:"7px 10px",background:T.redBg,borderRadius:5,lineHeight:1.4}}>{err}</div>}
@@ -2394,10 +2594,10 @@ return(
 
 /* ═══ APP ═══ */
 const getNav=r=>{
-if(r==="admin")return[{id:"overview",l:"Overview",ic:"dash"},{id:"sales",l:"Sales",ic:"sales"},{id:"revenue",l:"Revenue",ic:"bar"},{id:"finance",l:"Finance",ic:"fin"},{id:"auto",l:"Automations",ic:"zap"},{id:"tasks",l:"Tasks",ic:"task"},{id:"att",l:"Attendance",ic:"punch"},{id:"team",l:"Team",ic:"users"},{id:"integrations",l:"Integrations",ic:"link"}];
+if(r==="admin")return[{id:"overview",l:"Overview",ic:"dash"},{id:"sales",l:"Sales",ic:"sales"},{id:"revenue",l:"Revenue",ic:"bar"},{id:"finance",l:"Finance",ic:"fin"},{id:"tasks",l:"Tasks",ic:"task"},{id:"att",l:"Attendance",ic:"punch"},{id:"team",l:"Team",ic:"users"}];
 if(r==="sales")return[{id:"sales",l:"Sales",ic:"sales"},{id:"tasks",l:"My Tasks",ic:"task"}];
 if(r==="finance")return[{id:"finance",l:"Finance",ic:"fin"},{id:"tasks",l:"My Tasks",ic:"task"}];
-return[{id:"auto",l:"Automations",ic:"zap"},{id:"tasks",l:"My Tasks",ic:"task"}];
+return[{id:"tasks",l:"My Tasks",ic:"task"}];
 };
 
 export default function App(){
@@ -2427,13 +2627,39 @@ useEffect(()=>{
   return()=>window.removeEventListener("resize",onResize);
 },[]);
 
+/* ─── Push notifications ────────────────────────────────────── */
+/* Subscribe the device once logged in. iOS/Safari only show the permission
+   prompt from a user gesture, so when permission is still "default" we defer
+   to the first tap/click. A push click deep-links via ?lead= or a SW message. */
+useEffect(()=>{
+  if(!user||!isPushSupported())return;
+
+  // Notification click while the app is already open → jump to Sales.
+  const onMsg=(e)=>{if(e?.data?.type==="OPEN_LEAD")setPg("sales");};
+  navigator.serviceWorker?.addEventListener?.("message",onMsg);
+  // Cold-open from a notification: ?lead=<id> in the URL.
+  try{if(new URLSearchParams(window.location.search).get("lead"))setPg("sales");}catch{}
+
+  let cleanupGesture=()=>{};
+  if(Notification.permission==="granted"){
+    initPushNotifications(user);
+  }else if(Notification.permission==="default"){
+    const onGesture=()=>{initPushNotifications(user);cleanupGesture();};
+    cleanupGesture=()=>{window.removeEventListener("pointerdown",onGesture);window.removeEventListener("keydown",onGesture);};
+    window.addEventListener("pointerdown",onGesture,{once:true});
+    window.addEventListener("keydown",onGesture,{once:true});
+  }
+
+  return()=>{navigator.serviceWorker?.removeEventListener?.("message",onMsg);cleanupGesture();};
+},[user]);
+
 /* ─── Auth ─────────────────────────────────────────────────── */
 /* Build user object from Supabase auth session — no DB fetch required to show UI */
 const authUserToProfile=(au)=>{
   const m=au.user_metadata||{};
   return{id:au.id,email:au.email||'',
     name:m.full_name||m.name||au.email?.split('@')[0]||'User',
-    role:m.app_role||'admin',subrole:m.app_subrole||'admin',dept:m.app_dept||'all',
+    role:m.app_role||'sales',subrole:m.app_subrole||'setter',dept:m.app_dept||'sales',
     provider:au.app_metadata?.provider||'password',createdAt:au.created_at,password:'••••••'};
 };
 
@@ -2445,8 +2671,18 @@ useEffect(()=>{
     setUser(p);setPg(getNav(p.role)[0]?.id);
     setWelcomeBack(p.name);setTimeout(()=>setWelcomeBack(null),2500);
     /* Enhance with DB profile in background — updates role/name if set via Team panel */
-    supabase.from('profiles').select('*').eq('id',session.user.id).single()
-      .then(({data})=>{if(data)setUser(profileFromDb(data));}).catch(()=>{});
+    supabase.from('profiles').select('*').eq('id',session.user.id).maybeSingle()
+      .then(({data})=>{
+        if(data){setUser(profileFromDb(data));}
+        else{
+          /* No profile row yet (user arrived via existing session) → create one.
+             onAuthStateChange skips INITIAL_SESSION, so this path must self-heal. */
+          supabase.from('profiles').upsert(
+            {id:session.user.id,name:p.name,email:p.email,role:p.role,subrole:p.subrole,dept:p.dept,provider:p.provider},
+            {onConflict:'id'}
+          ).then(({data:d2})=>{if(d2?.[0])setUser(profileFromDb(d2[0]));});
+        }
+      }).catch(()=>{});
   });
 
   const{data:{subscription}}=supabase.auth.onAuthStateChange((event,session)=>{
@@ -2476,32 +2712,49 @@ useEffect(()=>{
 useEffect(()=>{
   if(!user)return;
   /* Initial load */
+  /* Paginated leads fetch — Supabase caps single select at 1000 rows by default. */
+  const fetchAllLeads=async()=>{
+    const all=[];const chunk=1000;
+    for(let from=0;;from+=chunk){
+      const{data,error}=await supabase.from('leads').select('*').order('created_at',{ascending:false}).range(from,from+chunk-1);
+      if(error)return{data:all,error};
+      if(!data||data.length===0)break;
+      all.push(...data);
+      if(data.length<chunk)break;
+    }
+    return{data:all,error:null};
+  };
   Promise.all([
-    supabase.from('leads').select('*').order('created_at',{ascending:false}),
+    fetchAllLeads(),
     supabase.from('invoices').select('*').order('created_at',{ascending:false}),
     supabase.from('tasks').select('*').order('created_at',{ascending:false}),
     supabase.from('automations').select('*'),
     supabase.from('punch_state').select('*'),
     supabase.from('punch_records').select('*').order('date',{ascending:false}),
     supabase.from('pipelines').select('*').order('sort_order'),
-    supabase.from('setter_stages').select('*').order('sort_order'),
-    supabase.from('closer_stages').select('*').order('sort_order'),
+    /* Stages are loaded per active pipeline inside SalesP (see loadStagesForPipeline). */
     supabase.from('leaves').select('*').order('submitted_at',{ascending:false}),
     supabase.from('bank_payments').select('*').order('received_at',{ascending:false}),
     supabase.from('notifications').select('*').order('at',{ascending:false}),
     supabase.from('profiles').select('*'),
-  ]).then(([{data:ld},{data:id},{data:td},{data:ad},{data:psd},{data:phd},{data:ppd},{data:ssd},{data:csd},{data:lvd},{data:bpd},{data:nd},{data:pfd}])=>{
+  ]).then(([{data:ld},{data:id},{data:td},{data:ad},{data:psd},{data:phd},{data:ppd},{data:lvd},{data:bpd},{data:nd},{data:pfd}])=>{
     if(ld)setLeads(ld.map(leadFromDb));
     if(id)setInv(id);
     if(td)setTasks(td);
     if(ad)setAutos(ad);
     if(psd&&phd)setPunch(punchStateFromDb(psd,phd));
-    if(ppd&&ppd.length)setPipelines(ppd.map(p=>({...p,sources:Array.isArray(p.sources)?p.sources:(JSON.parse(p.sources||'[]'))})));
+    if(ppd&&ppd.length){
+      /* DB stores only real pipelines (no "all" row). Always prepend the
+         aggregate "all" entry from DEFAULT_PIPELINES so the dropdown
+         contains it — otherwise activePipeline defaults to "all", but
+         curPipeline falls back to pipelines[0] (e.g. Webinar), making the
+         header label say "Webinar" while stagesEditable is still false
+         and the Add/Edit/Delete stage controls stay hidden. */
+      const allRow=DEFAULT_PIPELINES.find(p=>p.id==="all");
+      const fromDb=ppd.map(p=>({...p,sources:Array.isArray(p.sources)?p.sources:(JSON.parse(p.sources||'[]'))}));
+      setPipelines(fromDb.some(p=>p.id==="all")?fromDb:[allRow,...fromDb]);
+    }
     else setPipelines(DEFAULT_PIPELINES);
-    if(ssd&&ssd.length)setSetterStages(ssd.map(s=>({id:s.id,l:s.label,c:s.color})));
-    else setSetterStages(DEFAULT_SETTER_STAGES);
-    if(csd&&csd.length)setCloserStages(csd.map(s=>({id:s.id,l:s.label,c:s.color})));
-    else setCloserStages(DEFAULT_CLOSER_STAGES);
     if(lvd)setLeaves(lvd.map(leaveFromDb));
     if(bpd)setBankPayments(bpd.map(bankPaymentFromDb));
     if(nd)setNotifications(nd.map(notifFromDb));
@@ -2579,7 +2832,8 @@ const updateLeave=(id,status)=>{
 const markNotifRead=(id)=>{setNotifications(p=>p.map(n=>n.id===id?{...n,read:true}:n));supabase.from('notifications').update({read:true}).eq('id',id);};
 const markAllRead=()=>{setNotifications(p=>p.map(n=>({...n,read:true})));supabase.from('notifications').update({read:true}).in('id',notifications.filter(n=>!n.read).map(n=>n.id));};
 
-/* Notify on new lead — wrap setLeads, write to DB */
+/* Notify on new lead — wrap setLeads, write to DB.
+   Real-time pings fire only during work hours (10:00–19:00 local). */
 const setLeadsNotify=(updater)=>{
   setLeads(prev=>{
     const next=typeof updater==="function"?updater(prev):updater;
@@ -2587,7 +2841,8 @@ const setLeadsNotify=(updater)=>{
       const newOnes=next.filter(n=>!prev.find(p=>p.id===n.id));
       newOnes.forEach(async l=>{
         await supabase.from('leads').insert(leadToDb(l));
-        const notif={id:uid(),type:"new_lead",msg:"New lead: "+l.name+" ("+l.company+") via "+l.source,at:new Date().toISOString(),read:false,for:"sales",linkTo:"sales"};
+        if(!isWorkHours())return;
+        const notif={id:uid(),type:"new_lead",msg:"🔥 Hot lead: "+l.name+" ("+l.company+") via "+l.source,at:new Date().toISOString(),read:false,for:"sales",linkTo:"sales"};
         setNotifications(p=>[notif,...p]);
         await supabase.from('notifications').insert(notifToDb(notif));
       });
@@ -2634,8 +2889,8 @@ return(
 {isMobile&&sb&&<div onClick={()=>setSb(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.6)",zIndex:90,backdropFilter:"blur(2px)"}}/>}
 
 <aside style={{
-  width:isMobile?(sb?260:0):(sb?200:52),
-  background:T.s1,
+  width:isMobile?(sb?260:0):(sb?216:56),
+  background:T.bg,
   borderRight:"1px solid "+T.bdr,
   display:"flex",
   flexDirection:"column",
@@ -2647,27 +2902,32 @@ return(
   zIndex:isMobile?100:1,
   boxShadow:isMobile&&sb?"4px 0 20px rgba(0,0,0,.5)":"none"
 }}>
-<div style={{padding:sb?"14px 14px 10px":"14px 8px 10px",display:"flex",alignItems:"center",gap:8,borderBottom:"1px solid "+T.bdr}}>
-<div style={{width:30,height:30,borderRadius:6,background:"linear-gradient(135deg,"+T.accD+","+T.acc+")",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><span style={{fontSize:11,fontWeight:800,color:"#000",fontFamily:MONO}}>HT</span></div>
-{sb&&<div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:700,color:T.tx}}>HTSyndicate</div><div style={{fontSize:8,color:T.tx3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user.name}</div></div>}
-{sb&&isMobile&&<button onClick={()=>setSb(false)} style={{background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:4}}><Ic t="x" s={16}/></button>}
+<div style={{height:56,display:"flex",alignItems:"center",justifyContent:"center",position:"relative",flexShrink:0}}>
+{sb?<img src="/logo.png" alt="HTSyndicate" style={{width:120,height:40,objectFit:"contain",display:"block",margin:"0 auto"}}/>
+   :<img src="/logo.png" alt="HTSyndicate" style={{width:36,height:36,objectFit:"contain",display:"block",margin:"0 auto"}}/>}
+{sb&&isMobile&&<button onClick={()=>setSb(false)} style={{position:"absolute",top:10,right:10,background:"none",border:"none",color:T.tx3,cursor:"pointer",padding:4}}><Ic t="x" s={16}/></button>}
 </div>
-<nav style={{flex:1,padding:"6px 4px",display:"flex",flexDirection:"column",gap:1,overflowY:"auto"}}>
-{nav.map(n=><button key={n.id} onClick={()=>{setPg(n.id);if(isMobile)setSb(false)}} style={{display:"flex",alignItems:"center",gap:10,padding:isMobile?"11px 12px":"7px 9px",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:isMobile?13:11,fontWeight:pg===n.id?600:500,background:pg===n.id?T.accBg:"transparent",color:pg===n.id?T.acc:T.tx3,justifyContent:sb?"flex-start":"center"}}><Ic t={n.ic} s={isMobile?17:15}/>{sb&&n.l}</button>)}
-<button onClick={()=>{setPg("leaves");if(isMobile)setSb(false)}} style={{display:"flex",alignItems:"center",gap:10,padding:isMobile?"11px 12px":"7px 9px",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:isMobile?13:11,fontWeight:pg==="leaves"?600:500,background:pg==="leaves"?T.accBg:"transparent",color:pg==="leaves"?T.acc:T.tx3,justifyContent:sb?"flex-start":"center"}}><Ic t="cal" s={isMobile?17:15}/>{sb&&"Leaves"}{sb&&user.role==="admin"&&leaves.filter(l=>l.status==="pending").length>0&&<span style={{marginLeft:"auto",fontSize:9,fontFamily:MONO,background:T.red,color:"#fff",padding:"1px 6px",borderRadius:99}}>{leaves.filter(l=>l.status==="pending").length}</span>}</button>
+<nav style={{flex:1,padding:"4px 0",display:"flex",flexDirection:"column",gap:2,overflowY:"auto"}}>
+{sb&&<div style={{fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:1.4,color:T.tx3,padding:"8px 16px 4px"}}>Menu</div>}
+{nav.map(n=>{const on=pg===n.id;return <button key={n.id} onClick={()=>{setPg(n.id);if(isMobile)setSb(false)}} onMouseEnter={e=>{if(!on)e.currentTarget.style.background="rgba(255,255,255,0.05)"}} onMouseLeave={e=>{if(!on)e.currentTarget.style.background="transparent"}} style={{display:"flex",alignItems:"center",gap:10,height:36,margin:"0 8px",padding:sb?"0 12px":"0",borderRadius:8,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:13,fontWeight:on?600:500,background:on?T.accBg:"transparent",color:on?T.acc:T.tx2,justifyContent:sb?"flex-start":"center",transition:"background .15s,color .15s"}}><Ic t={n.ic} s={17}/>{sb&&n.l}</button>})}
+<button onClick={()=>{setPg("leaves");if(isMobile)setSb(false)}} onMouseEnter={e=>{if(pg!=="leaves")e.currentTarget.style.background="rgba(255,255,255,0.05)"}} onMouseLeave={e=>{if(pg!=="leaves")e.currentTarget.style.background="transparent"}} style={{display:"flex",alignItems:"center",gap:10,height:36,margin:"0 8px",padding:sb?"0 12px":"0",borderRadius:8,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:13,fontWeight:pg==="leaves"?600:500,background:pg==="leaves"?T.accBg:"transparent",color:pg==="leaves"?T.acc:T.tx2,justifyContent:sb?"flex-start":"center",transition:"background .15s,color .15s"}}><Ic t="cal" s={17}/>{sb&&"Leaves"}{sb&&user.role==="admin"&&leaves.filter(l=>l.status==="pending").length>0&&<span style={{marginLeft:"auto",fontSize:9,fontFamily:MONO,background:T.red,color:"#fff",padding:"1px 6px",borderRadius:99}}>{leaves.filter(l=>l.status==="pending").length}</span>}</button>
 </nav>
-<div style={{padding:"6px 4px",borderTop:"1px solid "+T.bdr}}>
+<div style={{padding:"6px 4px"}}>
+{sb&&<div style={{display:"flex",alignItems:"center",gap:10,padding:12,margin:"0 4px 4px",borderTop:"1px solid "+T.bdr}}>
+<div style={{padding:1.5,borderRadius:99,border:"1.5px solid "+T.acc,display:"flex",flexShrink:0}}><Av name={user.name} sz={30}/></div>
+<div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:600,color:T.tx,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user.name}</div><div style={{fontSize:11,color:T.tx2,textTransform:"capitalize",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user.role}{user.dept?" · "+user.dept:""}</div></div>
+</div>}
 <button onClick={()=>setShowLeaveForm(true)} style={{display:"flex",alignItems:"center",gap:8,padding:isMobile?"10px 12px":"7px 9px",width:"100%",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:isMobile?12:10,color:T.acc,background:"transparent",justifyContent:sb?"flex-start":"center"}}><Ic t="cal" s={isMobile?15:13}/>{sb&&"Request Leave"}</button>
 {!isMobile&&<button onClick={()=>setSb(!sb)} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 9px",width:"100%",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:10,color:T.tx3,background:"transparent",justifyContent:sb?"flex-start":"center"}}><Ic t="menu" s={13}/>{sb&&"Collapse"}</button>}
 <button onClick={()=>{supabase.auth.signOut();setUser(null);setPg(null);setLeads([]);setInv([]);setTasks([]);setAutos([]);setPunch({});}} style={{display:"flex",alignItems:"center",gap:8,padding:isMobile?"10px 12px":"7px 9px",width:"100%",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:isMobile?12:10,color:T.red,background:"transparent",justifyContent:sb?"flex-start":"center"}}><Ic t="logout" s={isMobile?15:13}/>{sb&&"Logout"}</button></div></aside>
 <main style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0,width:"100%"}}>
-<header style={{padding:isMobile?"10px 14px":"9px 20px",borderBottom:"1px solid "+T.bdr,display:"flex",alignItems:"center",justifyContent:"space-between",background:T.s1,flexShrink:0,gap:8}}>
+<header style={{height:52,padding:isMobile?"0 14px":"0 24px",borderBottom:"1px solid "+T.bdr,display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(10,10,10,0.72)",backdropFilter:"blur(20px)",WebkitBackdropFilter:"blur(20px)",flexShrink:0,gap:8,position:"sticky",top:0,zIndex:40}}>
 {isMobile&&<button onClick={()=>setSb(true)} style={{background:"none",border:"none",cursor:"pointer",padding:4,color:T.tx,display:"flex",alignItems:"center"}}><Ic t="menu" s={20}/></button>}
-<div style={{flex:1,minWidth:0}}><h1 style={{margin:0,fontSize:isMobile?14:15,fontWeight:700,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{pg==="leaves"?"Leaves":(nav.find(n=>n.id===pg)?.l||"")}</h1>{!isMobile&&<p style={{margin:0,fontSize:9,color:T.tx3}}>{time.toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>}</div>
+<div style={{flex:1,minWidth:0}}><h1 style={{margin:0,fontSize:17,fontWeight:600,letterSpacing:-.3,color:T.tx,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{pg==="leaves"?"Leaves":(nav.find(n=>n.id===pg)?.l||"")}</h1>{!isMobile&&<p style={{margin:0,fontSize:12,color:T.tx2,marginTop:1}}>{time.toLocaleDateString("en-IN",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>}</div>
 <div style={{display:"flex",alignItems:"center",gap:isMobile?6:10,flexShrink:0}}>
 {!isMobile&&<button onClick={()=>setShowLeaveForm(true)} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px",borderRadius:6,border:"1px solid "+T.bdr,background:"transparent",color:T.tx2,cursor:"pointer",fontSize:11,fontFamily:FONT,fontWeight:500}}><Ic t="cal" s={12}/>Request Leave</button>}
 <button onClick={()=>setShowNotifs(!showNotifs)} style={{position:"relative",background:"transparent",border:"none",cursor:"pointer",padding:6}}><Ic t="bell" s={isMobile?18:16} c={myNotifs.length>0?T.acc:T.tx3}/>{myNotifs.length>0&&<span style={{position:"absolute",top:2,right:2,width:14,height:14,borderRadius:99,background:T.red,color:"#fff",fontSize:8,fontWeight:700,fontFamily:MONO,display:"flex",alignItems:"center",justifyContent:"center"}}>{myNotifs.length}</span>}</button>
-<Av name={user.name} sz={isMobile?32:28}/></div></header>
+<div style={{padding:2,borderRadius:99,border:"1.5px solid "+T.acc,display:"flex"}}><Av name={user.name} sz={isMobile?30:26}/></div></div></header>
 
 {/* Notifications dropdown */}
 {showNotifs&&<div style={{position:"absolute",top:isMobile?54:50,right:isMobile?10:20,left:isMobile?10:"auto",width:isMobile?"auto":340,maxHeight:420,background:T.s2,border:"1px solid "+T.bdr,borderRadius:10,zIndex:100,overflow:"hidden",boxShadow:"0 12px 40px rgba(0,0,0,.5)"}}>
@@ -2685,7 +2945,7 @@ return(
 {user.role!=="admin"&&punch[user.name]&&<PunchBar user={user} punch={punch} setPunch={handlePunch}/>}
 {pg==="overview"&&user.role==="admin"&&<OverP leads={leads} invoices={inv} tasks={tasks} autos={autos} punch={punch}/>}
 {pg==="sales"&&<SalesP user={user} leads={leads} setLeads={setLeadsNotify} pipelines={pipelines} setPipelines={setPipelines} setterStages={setterStages} setSetterStages={setSetterStages} closerStages={closerStages} setCloserStages={setCloserStages} allUsers={allUsers}/>}
-{pg==="revenue"&&user.role==="admin"&&<RevenueP leads={leads}/>}
+{pg==="revenue"&&user.role==="admin"&&<RevenueP leads={leads} pipelines={pipelines}/>}
 {pg==="finance"&&<FinP invoices={inv} setInvoices={setInv} leads={leads} bankPayments={bankPayments} setBankPayments={setBankPayments} linkBankPayment={linkBankPayment}/>}
 {pg==="auto"&&<AutoP autos={autos} setAutos={setAutos}/>}
 {pg==="tasks"&&<TaskP tasks={tasks} setTasks={setTasks} dept={user.dept}/>}

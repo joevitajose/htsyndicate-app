@@ -10,3 +10,7 @@ release
 .netlify
 .vercel
 .env*.local
+
+# One-off maintenance scripts that hardcode a service_role key (old iqvbv project).
+# Ignored so they can never be accidentally committed/published.
+scripts/*.cjs
