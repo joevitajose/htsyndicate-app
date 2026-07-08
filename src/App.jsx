@@ -620,7 +620,7 @@ return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
 </div></div>)}
 
 /* ═══ SALES ═══ */
-function SalesP({user,leads,setLeads,pipelines,setPipelines,setterStages,setSetterStages,closerStages,setCloserStages,allUsers}){
+function SalesP({user,leads,setLeads,pipelines,setPipelines,setterStages,setSetterStages,closerStages,setCloserStages,allUsers,focusLead,setFocusLead}){
 const subrole=user?.subrole||"admin";
 const isAdmin=subrole==="admin";
 const isSetter=subrole==="setter";
@@ -645,6 +645,23 @@ const stCd=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===
 const defaultView=isSetter?"setter":isCloser?"closer":"setter";
 const[vw,setVw]=useState(defaultView);
 const[sel,setSel]=useState(null);
+/* Open a specific lead's detail from another page (Tasks "open in Sales").
+   Works cross-pipeline: find the lead in the FULL list, hydrate it like the
+   kanban does, open the modal, then clear the TRIGGER (focusLead) — never sel —
+   so the modal stays open until the user closes it. */
+useEffect(()=>{
+  if(!focusLead)return;
+  const raw=(leads||[]).find(x=>x.id===focusLead);
+  if(raw){
+    const payments=raw.payments||[];const callLogs=raw.callLogs||[];
+    const connected=callLogs.length;
+    const dialed=raw.dialed!==undefined?raw.dialed:connected+Math.round(connected*0.4);
+    const cashCollected=payments.reduce((a,p)=>a+p.amount,0);
+    const revenue=raw.setterStage==="won"||raw.closerStage==="won"?raw.value:0;
+    setSel({...raw,heat:calcHeat(raw),ltv:cashCollected,cashCollected,revenue,dialed,connected});
+  }
+  setFocusLead&&setFocusLead(null);
+},[focusLead,leads]);
 const[showAdd,setShowAdd]=useState(false);
 const[showLog,setShowLog]=useState(null);
 const[showPay,setShowPay]=useState(null);
@@ -2084,6 +2101,66 @@ return(
 </div>)}
 
 /* ═══ TASKS ═══ */
+/* ─── My Leads (Item 1): a user's assigned leads by id, list → open in Sales ─── */
+function MyLeadsView({user,leads,allUsers,pipelines,openLead}){
+const isAdmin=user.role==="admin";
+const staff=(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer");
+const[who,setWho]=useState("everyone");/* admin filter: everyone | unassigned | <profileId> */
+const stLbl=(id,list)=>list.find(s=>s.id===id)?.l||id;
+const stCol=(id,list)=>list.find(s=>s.id===id)?.c||T.tx3;
+const pipeOf=(l)=>(pipelines||[]).find(p=>p.id!=="all"&&((l.pipeline||"").toLowerCase()===p.id.toLowerCase()||(p.sources||[]).includes(l.source)));
+const mine=useMemo(()=>{
+  if(!isAdmin){const key=user.subrole==="closer"?"closerId":"setterId";return (leads||[]).filter(l=>l[key]&&l[key]===user.id);}
+  if(who==="everyone")return (leads||[]).filter(l=>l.setterId||l.closerId);
+  if(who==="unassigned")return (leads||[]).filter(l=>!l.setterId&&!l.closerId);
+  return (leads||[]).filter(l=>l.setterId===who||l.closerId===who);
+},[leads,isAdmin,user,who]);
+const CAP=200;const shown=mine.slice(0,CAP);
+return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
+{isAdmin&&<div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+<span style={{fontSize:11,color:T.tx3}}>Show</span>
+<select value={who} onChange={e=>setWho(e.target.value)} style={{padding:"6px 10px",borderRadius:6,border:"1px solid "+T.bdr,background:T.inp,color:T.tx,fontSize:12,fontFamily:FONT,outline:"none"}}>
+<option value="everyone">Everyone (owned leads)</option>
+<option value="unassigned">Unassigned</option>
+{staff.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+</select>
+<span style={{fontSize:11,color:T.tx3,fontFamily:MONO}}>{mine.length} lead{mine.length!==1?"s":""}</span>
+</div>}
+<Crd title={isAdmin?"Leads":"My Leads"}>
+{mine.length===0?<div style={{padding:24,textAlign:"center",fontSize:12,color:T.tx3,lineHeight:1.5}}>{isAdmin?"No leads match this filter.":"No leads assigned to you yet — they'll appear here once you're assigned leads."}</div>:<>
+{shown.map(l=>{const pipe=pipeOf(l);const cash=(l.payments||[]).reduce((a,p)=>a+(Number(p.amount)||0),0);return(
+<div key={l.id} onClick={()=>openLead(l.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderBottom:"1px solid "+T.bdr+"30",cursor:"pointer",transition:"background .15s"}} onMouseEnter={e=>e.currentTarget.style.background=T.s3} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+<Av name={l.name} sz={28}/>
+<div style={{flex:1,minWidth:0}}>
+<div style={{fontSize:12,fontWeight:600,color:T.tx,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{l.name}</div>
+<div style={{fontSize:10,color:T.tx3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{l.email||l.phone||l.company||l.source||"—"}</div>
+</div>
+<div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
+<span style={{display:"inline-flex",alignItems:"center",gap:5,padding:"3px 9px",borderRadius:5,fontSize:10,fontWeight:600,background:(pipe?.color||T.tx3)+"18",color:pipe?.color||T.tx3,border:"1px solid "+(pipe?.color||T.tx3)+"40",whiteSpace:"nowrap"}}>{pipe&&<Ic t={pipe.icon} s={11} c={pipe.color||T.tx3}/>}{pipe?.name||"Unassigned"}</span>
+{l.setterStage&&<span title="Setter stage" style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 9px",borderRadius:5,fontSize:9,fontWeight:700,letterSpacing:.3,textTransform:"uppercase",background:stCol(l.setterStage,DEFAULT_SETTER_STAGES)+"18",color:stCol(l.setterStage,DEFAULT_SETTER_STAGES),border:"1px solid "+stCol(l.setterStage,DEFAULT_SETTER_STAGES)+"40",whiteSpace:"nowrap"}}><span style={{opacity:.55,fontSize:8}}>S</span>{stLbl(l.setterStage,DEFAULT_SETTER_STAGES)}</span>}
+{l.closerStage&&<span title="Closer stage" style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 9px",borderRadius:5,fontSize:9,fontWeight:700,letterSpacing:.3,textTransform:"uppercase",background:stCol(l.closerStage,DEFAULT_CLOSER_STAGES)+"18",color:stCol(l.closerStage,DEFAULT_CLOSER_STAGES),border:"1px solid "+stCol(l.closerStage,DEFAULT_CLOSER_STAGES)+"40",whiteSpace:"nowrap"}}><span style={{opacity:.55,fontSize:8}}>C</span>{stLbl(l.closerStage,DEFAULT_CLOSER_STAGES)}</span>}
+{cash>0&&<span style={{fontFamily:MONO,fontSize:10,fontWeight:700,color:T.grn,whiteSpace:"nowrap"}}>{fS(cash)}</span>}
+</div>
+</div>);})}
+{mine.length>CAP&&<div style={{padding:"10px 14px",fontSize:10,color:T.tx3,textAlign:"center"}}>Showing first {CAP} of {mine.length} — open the Sales board for the full list.</div>}
+</>}
+</Crd>
+</div>);
+}
+
+/* Tasks page: tabs for "My Leads" (Item 1) + the existing to-do board. */
+function TasksHub({user,leads,allUsers,pipelines,tasks,setTasks,openLead}){
+const[tab,setTab]=useState("leads");
+const TabBtn=({id,label})=><button onClick={()=>setTab(id)} style={{padding:"8px 16px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:13,fontWeight:tab===id?700:500,background:tab===id?T.accBg:"transparent",color:tab===id?T.acc:T.tx2}}>{label}</button>;
+return(<div style={{display:"flex",flexDirection:"column",gap:14}}>
+<div style={{display:"flex",gap:4,background:T.s1,borderRadius:10,padding:4,border:"1px solid "+T.bdr,alignSelf:"flex-start"}}>
+<TabBtn id="leads" label="My Leads"/>
+<TabBtn id="todos" label="To-dos"/>
+</div>
+{tab==="leads"?<MyLeadsView user={user} leads={leads} allUsers={allUsers} pipelines={pipelines} openLead={openLead}/>:<TaskP tasks={tasks} setTasks={setTasks} dept={user.dept}/>}
+</div>);
+}
+
 function TaskP({tasks,setTasks,dept}){const[fd,setFd]=useState("all");const[showAdd,setShowAdd]=useState(false);const[newT,setNewT]=useState({title:"",dept:"sales",assignee:"",priority:"medium",due:""});
 const vis=useMemo(()=>{let t=tasks;if(dept!=="all")t=t.filter(x=>x.dept===dept);if(fd!=="all")t=t.filter(x=>x.dept===fd);return t},[tasks,fd,dept]);
 const mv=(id,s)=>{setTasks(p=>p.map(t=>t.id===id?{...t,status:s}:t));supabase.from('tasks').update({status:s}).eq('id',id);};
@@ -2623,7 +2700,7 @@ const[integrations,setIntegrations]=useState({
   googleSheets:{connected:false,sheetUrl:"",lastSync:null,sheetId:""},
   whop:{connected:false,apiKey:"",lastSync:null,productId:""}
 });
-const[leads,setLeads]=useState([]);const[inv,setInv]=useState([]);const[tasks,setTasks]=useState([]);const[autos,setAutos]=useState([]);const[punch,setPunch]=useState({});
+const[leads,setLeads]=useState([]);const[inv,setInv]=useState([]);const[tasks,setTasks]=useState([]);const[autos,setAutos]=useState([]);const[punch,setPunch]=useState({});const[focusLead,setFocusLead]=useState(null);
 const[pipelines,setPipelines]=useState([]);
 const[setterStages,setSetterStages]=useState([]);
 const[closerStages,setCloserStages]=useState([]);
@@ -2959,11 +3036,11 @@ return(
 <div style={{flex:1,overflow:"auto",padding:isMobile?12:18}}>
 {user.role!=="admin"&&punch[user.name]&&<PunchBar user={user} punch={punch} setPunch={handlePunch}/>}
 {pg==="overview"&&user.role==="admin"&&<OverP leads={leads} invoices={inv} tasks={tasks} autos={autos} punch={punch}/>}
-{pg==="sales"&&<SalesP user={user} leads={leads} setLeads={setLeadsNotify} pipelines={pipelines} setPipelines={setPipelines} setterStages={setterStages} setSetterStages={setSetterStages} closerStages={closerStages} setCloserStages={setCloserStages} allUsers={allUsers}/>}
+{pg==="sales"&&<SalesP user={user} leads={leads} setLeads={setLeadsNotify} pipelines={pipelines} setPipelines={setPipelines} setterStages={setterStages} setSetterStages={setSetterStages} closerStages={closerStages} setCloserStages={setCloserStages} allUsers={allUsers} focusLead={focusLead} setFocusLead={setFocusLead}/>}
 {pg==="revenue"&&user.role==="admin"&&<RevenueP leads={leads} pipelines={pipelines}/>}
 {pg==="finance"&&<FinP invoices={inv} setInvoices={setInv} leads={leads} bankPayments={bankPayments} setBankPayments={setBankPayments} linkBankPayment={linkBankPayment}/>}
 {pg==="auto"&&<AutoP autos={autos} setAutos={setAutos}/>}
-{pg==="tasks"&&<TaskP tasks={tasks} setTasks={setTasks} dept={user.dept}/>}
+{pg==="tasks"&&<TasksHub user={user} leads={leads} allUsers={allUsers} pipelines={pipelines} tasks={tasks} setTasks={setTasks} openLead={id=>{setFocusLead(id);setPg("sales");}}/>}
 {pg==="att"&&user.role==="admin"&&<AttP punch={punch}/>}
 {pg==="leaves"&&<LeavesP user={user} leaves={leaves} updateLeave={updateLeave} onRequest={()=>setShowLeaveForm(true)}/>}
 {pg==="team"&&user.role==="admin"&&<TeamP allUsers={allUsers} setAllUsers={setAllUsers}/>}
