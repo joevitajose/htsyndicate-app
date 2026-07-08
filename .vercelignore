@@ -1,0 +1,5 @@
+# Keep secrets and local-only tooling out of the Vercel upload.
+.env
+.env.*
+google-credentials.json
+scripts/

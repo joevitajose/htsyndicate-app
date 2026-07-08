@@ -273,7 +273,10 @@ const handleSignUp=async()=>{
   if(pw.length<6){setErr("Password must be at least 6 characters");setLoading(false);return}
   const dept=role==="admin"?"all":role==="sales"?"sales":role==="finance"?"finance":"tech";
   const finalSubrole=role==="sales"?subrole:role==="admin"?"admin":role;
-  const displayName=role==="sales"?(name+" ("+(subrole==="setter"?"Setter":"Closer")+")"):name+(role==="admin"?" (Admin)":role==="finance"?" (Finance)":" (Tech)");
+  /* Store the name CLEAN — no role suffix. The role is a separate field
+     (profiles.role/subrole) and the UI derives its label from that, so the
+     name never goes stale when someone is promoted. */
+  const displayName=name.trim();
   console.log("[SIGNUP] Creating account:",em.trim(),"role:",role);
   /* Store role in Supabase user_metadata — persists without a profiles table */
   const{data,error}=await supabase.auth.signUp({
@@ -2593,6 +2596,9 @@ You'll join as a <b style={{color:T.tx2}}>Setter</b> — pipeline, lead sheet, c
 )}
 
 /* ═══ APP ═══ */
+/* Human-readable role label derived from the role/subrole FIELDS (never the
+   name string) — so it stays correct after a promotion. */
+const roleLabel=(u)=>u?.role==="admin"?"Admin":u?.role==="sales"?(u?.subrole==="closer"?"Closer":"Setter"):u?.role==="finance"?"Finance":u?.role==="tech"?"Tech":(u?.role||"");
 const getNav=r=>{
 if(r==="admin")return[{id:"overview",l:"Overview",ic:"dash"},{id:"sales",l:"Sales",ic:"sales"},{id:"revenue",l:"Revenue",ic:"bar"},{id:"finance",l:"Finance",ic:"fin"},{id:"tasks",l:"Tasks",ic:"task"},{id:"att",l:"Attendance",ic:"punch"},{id:"team",l:"Team",ic:"users"}];
 if(r==="sales")return[{id:"sales",l:"Sales",ic:"sales"},{id:"tasks",l:"My Tasks",ic:"task"}];
@@ -2915,7 +2921,7 @@ return(
 <div style={{padding:"6px 4px"}}>
 {sb&&<div style={{display:"flex",alignItems:"center",gap:10,padding:12,margin:"0 4px 4px",borderTop:"1px solid "+T.bdr}}>
 <div style={{padding:1.5,borderRadius:99,border:"1.5px solid "+T.acc,display:"flex",flexShrink:0}}><Av name={user.name} sz={30}/></div>
-<div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:600,color:T.tx,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user.name}</div><div style={{fontSize:11,color:T.tx2,textTransform:"capitalize",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user.role}{user.dept?" · "+user.dept:""}</div></div>
+<div style={{flex:1,minWidth:0}}><div style={{fontSize:13,fontWeight:600,color:T.tx,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{user.name}</div><div style={{fontSize:11,color:T.tx2,textTransform:"capitalize",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{roleLabel(user)}{user.dept?" · "+user.dept:""}</div></div>
 </div>}
 <button onClick={()=>setShowLeaveForm(true)} style={{display:"flex",alignItems:"center",gap:8,padding:isMobile?"10px 12px":"7px 9px",width:"100%",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:isMobile?12:10,color:T.acc,background:"transparent",justifyContent:sb?"flex-start":"center"}}><Ic t="cal" s={isMobile?15:13}/>{sb&&"Request Leave"}</button>
 {!isMobile&&<button onClick={()=>setSb(!sb)} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 9px",width:"100%",borderRadius:6,border:"none",cursor:"pointer",fontFamily:FONT,fontSize:10,color:T.tx3,background:"transparent",justifyContent:sb?"flex-start":"center"}}><Ic t="menu" s={13}/>{sb&&"Collapse"}</button>}
