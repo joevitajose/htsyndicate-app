@@ -11,6 +11,15 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 /* ─── Field-name converters (DB snake_case ↔ App camelCase) ─── */
 
+const parseJsonArray = (v) => {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try { const p = JSON.parse(v || "[]"); return Array.isArray(p) ? p : []; }
+    catch { return []; }
+  }
+  return [];
+};
+
 export const leadFromDb = (r) => ({
   id: r.id,
   name: r.name,
@@ -29,15 +38,16 @@ export const leadFromDb = (r) => ({
   city: r.city,
   industry: r.industry,
   notes: r.notes,
+  tags: Array.isArray(r.tags) ? r.tags : [],
   createdAt: r.created_at,
   tokenPaidAt: r.token_paid_at,
   firstPaidAt: r.first_paid_at,
-  calls: r.calls ?? 0,
-  callLogs: r.call_logs ?? [],
-  followUps: r.follow_ups ?? [],
-  setterHistory: r.setter_history ?? [],
-  closerHistory: r.closer_history ?? [],
-  payments: r.payments ?? [],
+  calls: Number(r.calls) || 0,
+  callLogs: parseJsonArray(r.call_logs),
+  followUps: parseJsonArray(r.follow_ups),
+  setterHistory: parseJsonArray(r.setter_history),
+  closerHistory: parseJsonArray(r.closer_history),
+  payments: parseJsonArray(r.payments),
 });
 
 export const leadToDb = (l) => ({
@@ -58,6 +68,7 @@ export const leadToDb = (l) => ({
   city: l.city,
   industry: l.industry,
   notes: l.notes,
+  tags: l.tags ?? [],
   created_at: l.createdAt,
   token_paid_at: l.tokenPaidAt,
   first_paid_at: l.firstPaidAt,
