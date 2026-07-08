@@ -629,6 +629,11 @@ const canEdit=true;
 /* Live stage label/color lookup — uses the dynamic (persisted) stage lists, not the
    module-level defaults, so custom stages render their name/color everywhere (table,
    detail badge, history, notifications), not just as kanban columns. */
+/* Resolve a profile id → current display name (Item 0: assignment keys on id,
+   names are derived for display, never the source of truth). */
+const nameById=(id)=>id?((allUsers||[]).find(u=>u.id===id)?.name||""):"";
+const staffMembers=(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer");
+const noStaffMsg=<div style={{gridColumn:"1 / -1",padding:16,textAlign:"center",color:T.tx3,fontSize:12,lineHeight:1.5}}>No setters or closers yet — stats appear once your team signs up and leads are assigned.</div>;
 const stL=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===s)?.l||s;
 const stC=(s,kind)=>(kind==="closer"?closerStages:setterStages).find(x=>x.id===s)?.c||T.tx3;
 /* Stage label/color WITH default fallback — used by the global search panel, where a
@@ -1271,21 +1276,24 @@ return allTabs.filter(t=>{
 {/* DAILY REPORT */}
 {vw==="daily"&&<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Crd title={"Daily Report — "+TODAY}><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(p=>{const pL=leadsHydrated.filter(l=>l.setter===p.name||l.closer===p.name);const tc=pL.flatMap(l=>l.callLogs).filter(c=>c.date>=TODAY);
+{staffMembers.length===0&&noStaffMsg}
+{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(p=>{const pL=leadsHydrated.filter(l=>l.setterId===p.id||l.closerId===p.id);const tc=pL.flatMap(l=>l.callLogs).filter(c=>c.date>=TODAY);
 return(<div key={p.id} style={{background:T.s1,borderRadius:8,padding:14,border:"1px solid "+T.bdr}}>
 <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}><Av name={p.name} sz={32}/><div><div style={{fontSize:13,fontWeight:600,color:T.tx}}>{p.name}</div><div style={{fontSize:10,color:T.tx3}}>{p.subrole==="setter"?"Setter":"Closer"}</div></div></div>
 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
 {[{v:pL.length,l:"Leads",c:T.tx},{v:tc.length,l:"Calls Today",c:T.cyn},{v:pL.filter(l=>l.heat==="hot").length,l:"Hot Now",c:T.red}].map(s=><div key={s.l} style={{background:T.s2,borderRadius:5,padding:8,textAlign:"center"}}><div style={{fontSize:16,fontWeight:700,color:s.c,fontFamily:MONO}}>{s.v}</div><div style={{fontSize:8,color:T.tx3}}>{s.l}</div></div>)}</div></div>)})}</div></Crd>
 <Crd title="Productivity Check" action={<Bd text="AI Assessment" color="pur"/>}>
-{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(u=>{const pL=leadsHydrated.filter(l=>l.setter===u.name||l.closer===u.name);const sc=pL.length===0?0:Math.min(100,Math.round((pL.filter(l=>l.calls>0).length/pL.length)*100));const r=sc>=80?"low":sc>=60?"medium":"high";return(<div key={u.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid "+T.bdr+"12"}}>
+{staffMembers.length===0&&noStaffMsg}
+{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(u=>{const pL=leadsHydrated.filter(l=>l.setterId===u.id||l.closerId===u.id);const sc=pL.length===0?0:Math.min(100,Math.round((pL.filter(l=>l.calls>0).length/pL.length)*100));const r=sc>=80?"low":sc>=60?"medium":"high";return(<div key={u.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid "+T.bdr+"12"}}>
 <span style={{fontSize:12,fontWeight:500,color:T.tx,width:130}}>{u.name}</span>
 <div style={{flex:1}}><Bar v={sc} max={100} color={sc>=80?T.grn:T.yel} h={4}/></div>
 <Bd text={r+" risk"} color={r==="low"?"grn":r==="medium"?"yel":"red"}/><span style={{fontFamily:MONO,fontWeight:700,color:sc>=80?T.grn:T.yel}}>{sc}%</span></div>)})}</Crd></div>}
 
 {/* TEAM STATS */}
 {vw==="team"&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(u=>{const isSetter=u.subrole==="setter";const p={n:u.name,r:isSetter?"Setter":"Closer",ratios:isSetter?[{l:"Lead → Booked",v:ratioLeadToBooked+"%",c:T.acc},{l:"Booked → Show Up",v:ratioBookedToShowup+"%",c:T.cyn}]:[{l:"Show Up → Won",v:closerConvRate+"%",c:T.grn},{l:"Closer Pipeline",v:closerLeads.length,c:T.acc}]};
-const pL=leadsHydrated.filter(l=>p.r==="Setter"?l.setter===p.n:l.closer===p.n);const pW=pL.filter(l=>p.r==="Setter"?l.setterStage==="won":l.closerStage==="won");
+{staffMembers.length===0&&noStaffMsg}
+{(allUsers||[]).filter(u=>u.subrole==="setter"||u.subrole==="closer").map(u=>{const isSetter=u.subrole==="setter";const p={n:u.name,id:u.id,r:isSetter?"Setter":"Closer",ratios:isSetter?[{l:"Lead → Booked",v:ratioLeadToBooked+"%",c:T.acc},{l:"Booked → Show Up",v:ratioBookedToShowup+"%",c:T.cyn}]:[{l:"Show Up → Won",v:closerConvRate+"%",c:T.grn},{l:"Closer Pipeline",v:closerLeads.length,c:T.acc}]};
+const pL=leadsHydrated.filter(l=>p.r==="Setter"?l.setterId===p.id:l.closerId===p.id);const pW=pL.filter(l=>p.r==="Setter"?l.setterStage==="won":l.closerStage==="won");
 return(<Crd key={u.id} title={p.n}>
 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
 {[{v:pL.length,l:"Total Leads",c:T.tx},{v:pW.length,l:"Won",c:T.grn},{v:pL.reduce((a,l)=>a+l.calls,0),l:"Calls",c:T.cyn},{v:fS(pW.reduce((a,l)=>a+l.ltv,0)),l:"LTV Generated",c:T.acc}].map(s=><div key={s.l} style={{background:T.s1,borderRadius:5,padding:8,textAlign:"center"}}><div style={{fontSize:14,fontWeight:700,color:s.c,fontFamily:MONO}}>{s.v}</div><div style={{fontSize:8,color:T.tx3}}>{s.l}</div></div>)}</div>
@@ -1352,17 +1360,17 @@ return(<Crd key={u.id} title={p.n}>
   return(<div style={{display:"flex",flexDirection:"column",gap:6}}>
   <div style={{display:"flex",alignItems:"center",gap:6}}>
     <span style={{fontSize:11,color:T.tx3,width:46,flexShrink:0}}>Setter</span>
-    {setters.length>0?<select value={sel.setter||""} onChange={e=>updateLead(sel.id,{setter:e.target.value})} style={selStyle}>
+    {setters.length>0?<select value={sel.setterId||""} onChange={e=>{const id=e.target.value;updateLead(sel.id,{setterId:id||null,setter:setters.find(u=>u.id===id)?.name||""})}} style={selStyle}>
       <option value="">Unassigned</option>
-      {setters.map(u=><option key={u.id} value={u.name}>{u.name}</option>)}
-    </select>:<span style={{color:T.acc,fontSize:11,fontWeight:500}}>{sel.setter||"Unassigned"}</span>}
+      {setters.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+    </select>:<span style={{color:T.acc,fontSize:11,fontWeight:500}}>{nameById(sel.setterId)||sel.setter||"Unassigned"}</span>}
   </div>
   <div style={{display:"flex",alignItems:"center",gap:6}}>
     <span style={{fontSize:11,color:T.tx3,width:46,flexShrink:0}}>Closer</span>
-    {closers.length>0?<select value={sel.closer||""} onChange={e=>updateLead(sel.id,{closer:e.target.value})} style={selStyle}>
+    {closers.length>0?<select value={sel.closerId||""} onChange={e=>{const id=e.target.value;updateLead(sel.id,{closerId:id||null,closer:closers.find(u=>u.id===id)?.name||""})}} style={selStyle}>
       <option value="">Unassigned</option>
-      {closers.map(u=><option key={u.id} value={u.name}>{u.name}</option>)}
-    </select>:<span style={{color:T.blu,fontSize:11,fontWeight:500}}>{sel.closer||"Unassigned"}</span>}
+      {closers.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+    </select>:<span style={{color:T.blu,fontSize:11,fontWeight:500}}>{nameById(sel.closerId)||sel.closer||"Unassigned"}</span>}
   </div>
   </div>);
 })()}
@@ -1686,7 +1694,8 @@ const[f,setF]=useState({
 name:lead.name||"",company:lead.company||"",email:lead.email||"",phone:lead.phone||"",
 source:lead.source||"",priority:lead.priority||"warm",value:lead.value||0,
 product:lead.product||"",city:lead.city||"",industry:lead.industry||"",
-notes:lead.notes||"",setter:lead.setter||"",closer:lead.closer||""
+notes:lead.notes||"",setter:lead.setter||"",closer:lead.closer||"",
+setterId:lead.setterId||"",closerId:lead.closerId||""
 });
 const u=(k,v)=>setF(p=>({...p,[k]:v}));
 return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -1703,8 +1712,8 @@ return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Inp label="Product" value={f.product} onChange={v=>u("product",v)}/>
 <Inp label="City" value={f.city} onChange={v=>u("city",v)}/>
 <Inp label="Industry" value={f.industry} onChange={v=>u("industry",v)}/>
-<Sel label="Setter" value={f.setter} onChange={v=>u("setter",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="setter"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
-<Sel label="Closer" value={f.closer} onChange={v=>u("closer",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="closer"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
+<Sel label="Setter" value={f.setterId} onChange={v=>setF(p=>({...p,setterId:v,setter:(allUsers||[]).find(x=>x.id===v)?.name||""}))} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="setter"||x.role==="admin").map(x=>({v:x.id,l:x.name})))]}/>
+<Sel label="Closer" value={f.closerId} onChange={v=>setF(p=>({...p,closerId:v,closer:(allUsers||[]).find(x=>x.id===v)?.name||""}))} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="closer"||x.role==="admin").map(x=>({v:x.id,l:x.name})))]}/>
 </div>
 <Inp label="Notes" value={f.notes} onChange={v=>u("notes",v)} ta/>
 
@@ -1721,7 +1730,7 @@ return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
 <Btn v="pri" icon="chk" onClick={()=>{onSave(f)}}>Save Changes</Btn>
 </div></div></div>)}
 
-function AddLeadForm({onClose,onAdd,allUsers}){const[f,setF]=useState({name:"",company:"",email:"",phone:"",source:"",priority:"warm",value:"",product:"VIP Course",city:"",industry:"",notes:"",setter:"",closer:""});const u=(k,v)=>setF(p=>({...p,[k]:v}));
+function AddLeadForm({onClose,onAdd,allUsers}){const[f,setF]=useState({name:"",company:"",email:"",phone:"",source:"",priority:"warm",value:"",product:"VIP Course",city:"",industry:"",notes:"",setter:"",closer:"",setterId:"",closerId:""});const u=(k,v)=>setF(p=>({...p,[k]:v}));
 return(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
 <Inp label="Name" value={f.name} onChange={v=>u("name",v)} ph="Full name"/>
 <Inp label="Company" value={f.company} onChange={v=>u("company",v)} ph="Company"/>
@@ -1730,11 +1739,11 @@ return(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
 <Sel label="Source" value={f.source} onChange={v=>u("source",v)} opts={SOURCES.map(s=>({v:s,l:s}))}/>
 <Sel label="Priority" value={f.priority} onChange={v=>u("priority",v)} opts={[{v:"hot",l:"Hot"},{v:"warm",l:"Warm"},{v:"cold",l:"Cold"}]}/>
 <Inp label="Value" value={f.value} onChange={v=>u("value",v)} ph="2500000" type="number" mono/>
-<Sel label="Setter" value={f.setter} onChange={v=>u("setter",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="setter"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
-<Sel label="Closer" value={f.closer} onChange={v=>u("closer",v)} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="closer"||x.role==="admin").map(x=>({v:x.name,l:x.name})))]}/>
+<Sel label="Setter" value={f.setterId} onChange={v=>setF(p=>({...p,setterId:v,setter:(allUsers||[]).find(x=>x.id===v)?.name||""}))} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="setter"||x.role==="admin").map(x=>({v:x.id,l:x.name})))]}/>
+<Sel label="Closer" value={f.closerId} onChange={v=>setF(p=>({...p,closerId:v,closer:(allUsers||[]).find(x=>x.id===v)?.name||""}))} opts={[{v:"",l:"Unassigned"},...((allUsers||[]).filter(x=>x.subrole==="closer"||x.role==="admin").map(x=>({v:x.id,l:x.name})))]}/>
 <div style={{gridColumn:"span 2"}}><Inp label="Notes" value={f.notes} onChange={v=>u("notes",v)} ph="Context..." ta/></div>
 <div style={{gridColumn:"span 2",display:"flex",justifyContent:"flex-end",gap:6}}><Btn onClick={onClose}>Cancel</Btn>
-<Btn v="pri" icon="plus" onClick={()=>{if(!f.name||!f.company)return;const now=new Date().toISOString();onAdd({id:uid(),name:f.name,company:f.company,email:f.email,phone:f.phone,source:f.source,setterStage:"new",closerStage:null,priority:f.priority,value:+f.value||0,setter:f.setter,closer:f.closer,product:f.product,city:f.city,industry:f.industry,notes:f.notes,createdAt:now,tokenPaidAt:null,firstPaidAt:null,calls:0,callLogs:[],followUps:[{date:TODAY,done:false,note:"Initial outreach"}],setterHistory:[{stage:"new",at:now,by:"Manual"}],closerHistory:[],payments:[]})}}>Add Lead</Btn></div></div>)}
+<Btn v="pri" icon="plus" onClick={()=>{if(!f.name||!f.company)return;const now=new Date().toISOString();onAdd({id:uid(),name:f.name,company:f.company,email:f.email,phone:f.phone,source:f.source,setterStage:"new",closerStage:null,priority:f.priority,value:+f.value||0,setter:f.setter,closer:f.closer,setterId:f.setterId||null,closerId:f.closerId||null,product:f.product,city:f.city,industry:f.industry,notes:f.notes,createdAt:now,tokenPaidAt:null,firstPaidAt:null,calls:0,callLogs:[],followUps:[{date:TODAY,done:false,note:"Initial outreach"}],setterHistory:[{stage:"new",at:now,by:"Manual"}],closerHistory:[],payments:[]})}}>Add Lead</Btn></div></div>)}
 
 function LogCallForm({leads,info,onClose,onLog,allUsers,user}){const callerOpts=(allUsers||[]).filter(x=>x.subrole==="setter"||x.subrole==="closer"||x.role==="admin").map(x=>({v:x.name,l:x.name+(x.subrole?" ("+(x.subrole==="setter"?"Setter":"Closer")+")":"")}));const[lid,setLid]=useState(info.leadId||"");const[dur,setDur]=useState("");const[out,setOut]=useState("");const[by,setBy]=useState(user?.name||(callerOpts[0]?.v||""));
 return(<div style={{display:"flex",flexDirection:"column",gap:12}}>
