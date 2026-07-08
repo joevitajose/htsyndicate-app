@@ -14,3 +14,6 @@ release
 # One-off maintenance scripts that hardcode a service_role key (old iqvbv project).
 # Ignored so they can never be accidentally committed/published.
 scripts/*.cjs
+
+# Google service-account key file — must never be committed (read from env instead).
+google-credentials.json
